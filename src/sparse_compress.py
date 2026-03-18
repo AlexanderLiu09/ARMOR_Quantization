@@ -10,6 +10,7 @@ import wandb
 from typing import Tuple, Optional, Union, List, Literal
 import src.utils.normalizer as normalize
 import src.compression_parent as compression_parent
+from src.utils.quantize import quantize_per_group, dequantize_per_group
 
 class SparseCheckError(Exception):
     """Custom exception for sparse check errors."""
@@ -233,13 +234,32 @@ class SparseLinear(compression_parent.CompressedLinear):
         # print("original weight shape", self.original_weight.shape)
 
     def reconstruct_(self, denormalize: bool = True) -> torch.FloatTensor:
-        """reconstructs the weigth matrix from the quantized version"""
+        """reconstructs the weight matrix from the sparse values"""
         # print("reconstructing")
+        if self.quantized:
+            return self.reconstruct_quantized_(denormalize)
         if len(self.X.shape) == 1:
             reconstructed = torch.zeros((self.out_features, self.in_features), device=self.X.device, dtype=self.X.dtype)
             reconstructed[self.sparse_mask] = self.X
         else:
             reconstructed = self.X * self.sparse_mask
+
+        if denormalize:
+            reconstructed = self.normalizer.denormalize(reconstructed)
+
+        return reconstructed
+    
+    def reconstruct_quantized_(self, denormalize: bool = True) -> torch.FloatTensor:
+        """same as reconstruct_() but dequantizes first"""
+        assert len(self.X_int.shape) == 1, "Expect X_int to be 1D"
+
+        X_float = dequantize_per_group(self.X_int,
+                                       self.scale,
+                                       self.zero_point if self.zero_point.numel() > 0 else None,
+                                       self.quant_group_size)
+        
+        reconstructed = torch.zeros((self.out_features, self.in_features), device = X_float.device, dtype = X_float.dtype)
+        reconstructed[self.sparse_mask] = X_float
 
         if denormalize:
             reconstructed = self.normalizer.denormalize(reconstructed)
@@ -266,6 +286,27 @@ class SparseLinear(compression_parent.CompressedLinear):
         """Uncompress the sparse values to their original shape"""
         self.X = nn.Parameter(
             self.reconstruct_(denormalize=False).detach().clone())
+        
+    @torch.no_grad()
+    def quantize_sparse_values(self, n_bits, group_size, symmetric):
+        """Quantizes non-zero sparse values
+        """
+        assert len(self.X.shape) == 1, "X should be 1D"
+        X_int, scale, zero_point = quantize_per_group(self.X.data,
+                                                      n_bits, 
+                                                      group_size,
+                                                      symmetric)
+        del self.X
+
+        self.register_buffer("X_int", X_int)
+        self.register_buffer("scale", scale)
+        self.register_buffer("zero_point", zero_point if zero_point is not None else torch.tensor([], device = scale.device))
+
+        self.quant_n_bits = n_bits
+        self.quant_group_size = group_size
+        self.quant_symmetric = symmetric
+        self.quantized = True
+
         
     def check_mask(self, 
                    mask: Optional[torch.Tensor] = None,

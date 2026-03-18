@@ -642,7 +642,9 @@ class ARMOR_Linear(CompressedLinear):
             trainable_sparse.naive_compression_module.compress_sparse_values()
 
         if quant_config.enabled:
-            trainable_sparse.naive_compression_module.quantize_sparse_values() #TODO implement in SparseCompress.py
+            trainable_sparse.naive_compression_module.quantize_sparse_values(quant_config.n_bits,
+                                                                             quant_config.group_size,
+                                                                             quant_config.symmetric) 
         self.A = trainable_sparse.A
         self.B = trainable_sparse.B
         
