@@ -27,6 +27,7 @@ from src.sparse_compress import SparseLinear
 from src.utils import normalizer as normalize
 from src.utils import utils
 from src.utils.blockwise_diag_matricies import BlockwiseDiagMatrix
+from src.utils.quantize import fake_quantize, QuantConfig
     
 class BlockCompressLearnable(nn.Module):
     original_weight: torch.FloatTensor
@@ -102,10 +103,21 @@ class BlockCompressLearnable(nn.Module):
         
     #turn of gradient t
     def forward(self, permutations_to_ignore: Tuple[set[int],set[int]] = [{},{}], 
-                mask_kwargs: Optional[dict]= {}):
-        out = self.A @ self.naive_compression_module.reconstruct() @ self.B
-        return out
-            
+                mask_kwargs: Optional[dict]= {},
+                quant_config: Optional[QuantConfig] = None):
+        S = self.naive_compression_module.reconstruct()
+
+        #fake quantize all non zero values in S, write to clone
+        if quant_config is not None and quant_config.enabled:
+            sparse_mask = self.naive_compression_module.sparse_mask
+            S = S.clone()
+            S_non_zero_quantized = fake_quantize(S[sparse_mask], 
+                                                 quant_config.n_bits,
+                                                 quant_config.group_size,
+                                                 quant_config.symmetric)
+            S[sparse_mask] = S_non_zero_quantized
+
+        return self.A @ S @ self.B            
         
     def recon_loss(self, reduction: Literal["mean", "sum", "none"] = "mean",
                    zero_sub:bool = False, recon_weight: Optional[torch.FloatTensor] = None,
@@ -414,6 +426,13 @@ class TrainingConfig:
     log_freq: int = 1
     iter_save_path: Optional[str] = None
     iter_save_freq: int = -1
+    #new
+    quant_enabled: bool = False
+    quant_n_bits: int = 8
+    quant_group_size: int = 128
+    quant_symmetric: bool = True
+    quant_qat_start_iter: int = 0
+
     
     def __post_init__(self):
         self.iter_ablation = (self.iter_save_path is not None) and (self.iter_save_freq > 0)
@@ -476,7 +495,11 @@ class ARMOR_Linear(CompressedLinear):
         if training_config.logfile is not None:
             os.makedirs(os.path.dirname(training_config.logfile), exist_ok=True)
         
-        
+        quant_config = QuantConfig(training_config.quant_enabled,
+                                   training_config.quant_n_bits,
+                                   training_config.quant_group_size,
+                                   training_config.quant_qat_start_iter)
+
         normalized_weight = self.initialize_normalizer(
             normalizer=normalizer, normalizer_kwargs=normalizer_kwargs
         )
@@ -537,7 +560,11 @@ class ARMOR_Linear(CompressedLinear):
                 #reset the optimizers
                 optimizer.zero_grad()   
                 
-                recon_loss = trainable_sparse.recon_loss(reduction="mean") 
+                if i >= quant_config.qat_start_iter:
+                    recon_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=quant_config)
+                else:
+                    recon_loss = trainable_sparse.recon_loss(reduction="mean")
+
                 loss = recon_loss
              
                 loss.backward()
@@ -613,6 +640,9 @@ class ARMOR_Linear(CompressedLinear):
         if isinstance(trainable_sparse.naive_compression_module, SparseLinear):
             #we need to compress the sparse values
             trainable_sparse.naive_compression_module.compress_sparse_values()
+
+        if quant_config.enabled:
+            trainable_sparse.naive_compression_module.quantize_sparse_values() #TODO implement in SparseCompress.py
         self.A = trainable_sparse.A
         self.B = trainable_sparse.B
         
