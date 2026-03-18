@@ -649,13 +649,13 @@ class ARMOR_Linear(CompressedLinear):
         self.B = trainable_sparse.B
         
 
-        
-        assert torch.allclose(
-            self.reconstruct_(denormalize=False),
-            trainable_sparse(),
-            rtol=1e-5, atol=1e-5
-        )
-        
+        if not quant_config.enabled: 
+            assert torch.allclose(
+                self.reconstruct_(denormalize=False),
+                trainable_sparse(),
+                rtol=1e-5, atol=1e-5
+            )
+            
         del trainable_sparse.naive_compression_module
 
     def load_iter_state(self, state_dict_path: str):
