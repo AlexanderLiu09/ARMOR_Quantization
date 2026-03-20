@@ -1,0 +1,47 @@
+defaults:
+  - _self_
+  - ./@compression_config.naive_compression_config: prune
+  # - override compression_config.naive_compression_config.compression_config.normalizer_kwargs.norm_order: []
+
+init_config:
+  _target_: "src.ARMOR_compress.ARMOR_Linear"
+  verbose: False
+
+compression_config:
+  block_diagonal_config:
+    block_size: 32
+    importance_weight: "hessianDiag"
+
+
+  optimizer_config:
+    _target_: "torch.optim.Adam"
+    lr: 0.0001
+    # weight_decay: 0.001
+
+  training_config:
+    _target_: "src.ARMOR_compress.TrainingConfig"
+    n_iters: 3000
+    n_continous_updates_per_iter: 1
+    n_sparse_core_updates_per_iter: 1
+    sparse_core_step_select: "gradient_all_random"
+    loss_atol: 1e-8
+    loss_rtol: 1e-6
+    overall_patience: 100
+    log_freq: 100
+    quant_enabled: True
+    quant_n_bits: 8
+    quant_group_size: 128
+    quant_symmetric: True
+    quant_qat_start_iter: 500
+    # logging_path: "/data/lliu/PermPrune/test/permute.txt"
+    # plotting_path: "/data/lliu/PermPrune/test/permute.png"
+    # save_path: "/data/lliu/PermPrune/test/permute_{iter}.pt"
+    # save_freq: 1000 
+
+  normalizer_kwargs:
+    norm_order: [0, 1]
+    zero: [False, False]
+    p: 2
+
+
+
