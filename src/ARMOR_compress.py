@@ -498,6 +498,7 @@ class ARMOR_Linear(CompressedLinear):
         quant_config = QuantConfig(training_config.quant_enabled,
                                    training_config.quant_n_bits,
                                    training_config.quant_group_size,
+                                   training_config.quant_symmetric,
                                    training_config.quant_qat_start_iter)
 
         normalized_weight = self.initialize_normalizer(
