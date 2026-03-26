@@ -561,7 +561,7 @@ class ARMOR_Linear(CompressedLinear):
                 #reset the optimizers
                 optimizer.zero_grad()   
                 
-                if i >= quant_config.qat_start_iter:
+                if i >= quant_config.qat_start_iter and quant_config.enabled:
                     recon_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=quant_config)
                 else:
                     recon_loss = trainable_sparse.recon_loss(reduction="mean")

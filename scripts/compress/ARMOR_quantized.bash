@@ -46,11 +46,14 @@ run_name="ARMOR_Q${quant_n_bits}/${block_size}_${n_iters}/${run_name}"
 cmd="CUDA_VISIBLE_DEVICES=${gpus} python -u ParallelCompress.py \
     base_model=$model \
     log_wandb=True \
-    compress=ARMOR \
+    compress=ARMOR_quantized \
     run_name=$run_name \
     compress.compression_config.block_diagonal_config.block_size=$block_size \
     +compress.compression_config.naive_compression_config.compression_config.pattern=[2,4] \
-    compress.compression_config.training_config.n_iters=$n_iters
+    compress.compression_config.training_config.n_iters=$n_iters \
+    compress.compression_config.training_config.quant_n_bits=$quant_n_bits \
+    compress.compression_config.training_config.quant_group_size=$quant_group_size \
+    compress.compression_config.training_config.quant_qat_start_iter=$quant_start
      \"datasets=${dataset_config}\""
 
 #split the additional args by space and add them to the command
