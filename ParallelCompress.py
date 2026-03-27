@@ -163,6 +163,9 @@ def compression_worker(
                     ncm.register_buffer("scale", state_dict.pop("naive_compression_module.scale"))
                     ncm.register_buffer("zero_point", state_dict.pop("naive_compression_module.zero_point"))
                     ncm.quantized = True
+                    ncm.quant_n_bits = cfg.compress.compression_config.training_config.quant_n_bits
+                    ncm.quant_group_size = cfg.compress.compression_config.training_config.quant_group_size
+                    ncm.quant_symmetric = cfg.compress.compression_config.training_config.quant_symmetric
                 compression_module.load_state_dict(state_dict, strict=False)
                 compression_module.to(original_dtype)
             else:
@@ -513,6 +516,9 @@ def main(cfg: DictConfig):
                 ncm.register_buffer("scale", state_dict.pop("naive_compression_module.scale"))
                 ncm.register_buffer("zero_point", state_dict.pop("naive_compression_module.zero_point"))
                 ncm.quantized = True
+                ncm.quant_n_bits = cfg.compress.compression_config.training_config.quant_n_bits
+                ncm.quant_group_size = cfg.compress.compression_config.training_config.quant_group_size
+                ncm.quant_symmetric = cfg.compress.compression_config.training_config.quant_symmetric
             layer.load_state_dict(state_dict, strict=False)
             layer.to(orig_dtype)
             # delete the state dict to save memory
