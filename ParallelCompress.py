@@ -492,6 +492,16 @@ def main(cfg: DictConfig):
             orig_device = next(layer.parameters()).device
             # load the state dict
             state_dict = torch.load(save_path, map_location=orig_device)
+            # If the checkpoint was quantized, the naive_compression_module will have
+            # X_int/scale/zero_point instead of X. Prepare the module to match.
+            if "naive_compression_module.X_int" in state_dict:
+                ncm = layer.naive_compression_module
+                if hasattr(ncm, 'X'):
+                    del ncm.X
+                ncm.register_buffer("X_int", torch.empty(0))
+                ncm.register_buffer("scale", torch.empty(0))
+                ncm.register_buffer("zero_point", torch.empty(0))
+                ncm.quantized = True
             layer.load_state_dict(state_dict)
             layer.to(orig_dtype)
             # delete the state dict to save memory
