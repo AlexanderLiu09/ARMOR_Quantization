@@ -162,7 +162,7 @@ def compression_worker(
                     ncm.register_buffer("scale", torch.empty(0))
                     ncm.register_buffer("zero_point", torch.empty(0))
                     ncm.quantized = True
-                compression_module.load_state_dict(state_dict)
+                compression_module.load_state_dict(state_dict, assign=True)
                 compression_module.to(original_dtype)
             else:
                 if cfg.iter_sweep:
@@ -512,7 +512,7 @@ def main(cfg: DictConfig):
                 ncm.register_buffer("scale", torch.empty(0))
                 ncm.register_buffer("zero_point", torch.empty(0))
                 ncm.quantized = True
-            layer.load_state_dict(state_dict)
+            layer.load_state_dict(state_dict, assign=True)
             layer.to(orig_dtype)
             # delete the state dict to save memory
             del state_dict
