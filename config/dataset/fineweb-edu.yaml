@@ -1,0 +1,5 @@
+_target_: "src.data.PretrainDatasetConfig"
+dataset_name: "HuggingFaceFW/fineweb-edu"
+dataset_instance: "default"
+split: "train"
+text_column: "text"

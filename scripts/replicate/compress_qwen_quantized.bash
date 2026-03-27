@@ -5,11 +5,12 @@ datetime=$(date +"%Y%m%d_%H%M%S")
 
 model_name=$1
 gpus=$2 #change this for your machine
-if [ -z "$3" ]; then
+dataset=${3:-fineweb-edu} #dataset config name, default fineweb-edu
+if [ -z "$4" ]; then
     num_processes=-1 #for inference
     parallelize=false
 else
-    num_processes=$3
+    num_processes=$4
     parallelize=true
 fi
 
@@ -26,7 +27,7 @@ quant_start=500
 
 echo "Compressing model: $model_name"
 echo "Generating data"
-generate_cmd="CUDA_VISIBLE_DEVICES=${gpus} scripts/calibration_data_generation/generate.bash ${model_name} SlimPajama-627B 128 8192"
+generate_cmd="CUDA_VISIBLE_DEVICES=${gpus} scripts/calibration_data_generation/generate.bash ${model_name} ${dataset} 128 8192"
 echo "$generate_cmd"
 eval "$generate_cmd"
 if [ $? -ne 0 ]; then
@@ -43,7 +44,7 @@ scripts/compress/ARMOR_quantized.bash run_name=${datetime} \
     model="${model_name}" \
     block_size=$block_size \
     n_iters=$n_iters \
-    dataset_config="[{dataset_config:SlimPajama-627B,n_samples:128,ctx_len:8192}]" \
+    dataset_config="[{dataset_config:${dataset},n_samples:128,ctx_len:8192}]" \
     gpus="${gpus}" \
     quant_n_bits=$quant_n_bits \
     quant_group_size=$quant_group_size \
