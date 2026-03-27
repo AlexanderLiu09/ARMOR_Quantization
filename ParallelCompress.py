@@ -149,10 +149,20 @@ def compression_worker(
             # compress the layer
             if cfg.resume_layerwise and os.path.exists(os.path.join(cfg.temp_path, layer_name + ".pt")):
                 compression_module.blank_recreate(**cfg.compress.compression_config)
-                compression_module.load_state_dict(torch.load(
+                state_dict = torch.load(
                     os.path.join(cfg.temp_path, layer_name + ".pt"),
                     map_location=device
-                ))
+                )
+                # If the checkpoint was quantized, prepare the module to match
+                if "naive_compression_module.X_int" in state_dict:
+                    ncm = compression_module.naive_compression_module
+                    if hasattr(ncm, 'X'):
+                        del ncm.X
+                    ncm.register_buffer("X_int", torch.empty(0))
+                    ncm.register_buffer("scale", torch.empty(0))
+                    ncm.register_buffer("zero_point", torch.empty(0))
+                    ncm.quantized = True
+                compression_module.load_state_dict(state_dict)
                 compression_module.to(original_dtype)
             else:
                 if cfg.iter_sweep:
