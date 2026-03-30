@@ -126,7 +126,7 @@ def main():
         model = get_compressed_model_class(args.model_name).from_pretrained(args.model_path,
                                                         torch_dtype=torch.float16,
                                                         device_map="auto")
-        
+        # raise ValueError("stop")
     else:
         if args.model_path is not None:
             model = AutoModelForCausalLM.from_pretrained(

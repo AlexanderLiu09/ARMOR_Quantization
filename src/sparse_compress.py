@@ -51,6 +51,7 @@ def get_group_and_n_nonzero(
 class SparseLinear(compression_parent.CompressedLinear):
     name = "SparseLinear"
     compression_measure = "parameters"
+    quantized = False 
 
     @torch.no_grad()
     def sparsify(
@@ -287,24 +288,24 @@ class SparseLinear(compression_parent.CompressedLinear):
         self.X = nn.Parameter(
             self.reconstruct_(denormalize=False).detach().clone())
         
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        # If X_int is in the state dict, this was a quantized checkpoint.
-        # Restore metadata attributes that aren't saved in state_dict.
-        if prefix + "X_int" in state_dict:
-            self.quantized = True
-            if hasattr(self, 'X'):
-                del self.X
-            if not hasattr(self, 'X_int'):
-                self.register_buffer("X_int", torch.empty(0))
-            if not hasattr(self, 'scale'):
-                self.register_buffer("scale", torch.empty(0))
-            if not hasattr(self, 'zero_point'):
-                self.register_buffer("zero_point", torch.empty(0))
-        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-        if self.quantized and not hasattr(self, 'quant_n_bits'):
-            self.quant_n_bits = 8
-            self.quant_group_size = 128
-            self.quant_symmetric = True
+    # def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+    #     # If X_int is in the state dict, this was a quantized checkpoint.
+    #     # Restore metadata attributes that aren't saved in state_dict.
+    #     if prefix + "X_int" in state_dict:
+    #         self.quantized = True
+    #         if hasattr(self, 'X'):
+    #             del self.X
+    #         if not hasattr(self, 'X_int'):
+    #             self.register_buffer("X_int", torch.empty(0))
+    #         if not hasattr(self, 'scale'):
+    #             self.register_buffer("scale", torch.empty(0))
+    #         if not hasattr(self, 'zero_point'):
+    #             self.register_buffer("zero_point", torch.empty(0))
+    #     super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+    #     if self.quantized and not hasattr(self, 'quant_n_bits'):
+    #         self.quant_n_bits = 8
+    #         self.quant_group_size = 128
+    #         self.quant_symmetric = True
 
     @torch.no_grad()
     def quantize_sparse_values(self, n_bits, group_size, symmetric):
@@ -325,6 +326,7 @@ class SparseLinear(compression_parent.CompressedLinear):
         self.quant_group_size = group_size
         self.quant_symmetric = symmetric
         self.quantized = True
+
 
         
     def check_mask(self, 
