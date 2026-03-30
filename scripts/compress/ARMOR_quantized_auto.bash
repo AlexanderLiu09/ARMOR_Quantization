@@ -43,18 +43,7 @@ do
     fi
 done
 
-upload_and_destroy() {
-    local model_path=$1
-    local box_path="ARMOR/${model_path}"
-
-    echo "Uploading ${model_path} to ${rclone_remote}:${box_path} ..."
-    rclone copy "$model_path" "${rclone_remote}:${box_path}" --progress
-    if [ $? -ne 0 ]; then
-        echo "ERROR: rclone upload failed. NOT destroying instance."
-        return 1
-    fi
-    echo "Upload complete."
-
+stop_instance() {
     echo "Stopping vast instance in 30 seconds (Ctrl+C to cancel)..."
     sleep 30
     if [ -n "$vast_api_key" ]; then
@@ -63,6 +52,21 @@ upload_and_destroy() {
         vastai stop instance "$VAST_CONTAINERLABEL"
     fi
 }
+
+upload() {
+    local model_path=$1
+    local box_path="ARMOR/${model_path}"
+
+    echo "Uploading ${model_path} to ${rclone_remote}:${box_path} ..."
+    rclone copy "$model_path" "${rclone_remote}:${box_path}" --progress
+    if [ $? -ne 0 ]; then
+        echo "ERROR: rclone upload failed."
+        return 1
+    fi
+    echo "Upload complete."
+}
+
+trap stop_instance EXIT
 
 original_run_name=$run_name
 run_name="ARMOR_Q${quant_n_bits}/${block_size}_${n_iters}/${run_name}"
@@ -97,10 +101,10 @@ eval $cmd
 exit_code=$?
 
 if [ $exit_code -ne 0 ]; then
-    echo "Compression failed with exit code $exit_code. NOT uploading or destroying."
+    echo "Compression failed with exit code $exit_code. Skipping upload."
     exit $exit_code
 fi
 
 model_output="models/${model}/compressed/${run_name}/model"
 echo "Compression finished successfully."
-upload_and_destroy "$model_output"
+upload "$model_output" || exit 1
