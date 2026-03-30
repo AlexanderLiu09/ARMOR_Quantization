@@ -1,6 +1,6 @@
 #!/bin/bash
-# Same as ARMOR_quantized.bash but automatically stops the vast instance
-# when compression finishes (or fails).
+# Same as ARMOR_quantized.bash but automatically uploads the compressed model
+# to Box via rclone and stops the vast instance when compression finishes.
 
 enviroment="ARMOR_main"
 
@@ -55,12 +55,12 @@ upload_and_destroy() {
     fi
     echo "Upload complete."
 
-    echo "Destroying vast instance in 30 seconds (Ctrl+C to cancel)..."
+    echo "Stopping vast instance in 30 seconds (Ctrl+C to cancel)..."
     sleep 30
     if [ -n "$vast_api_key" ]; then
-        vastai destroy instance "$VAST_CONTAINERLABEL" --api-key "$vast_api_key"
+        vastai stop instance "$VAST_CONTAINERLABEL" --api-key "$vast_api_key"
     else
-        vastai destroy instance "$VAST_CONTAINERLABEL"
+        vastai stop instance "$VAST_CONTAINERLABEL"
     fi
 }
 
