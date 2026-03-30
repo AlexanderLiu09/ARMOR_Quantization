@@ -19,7 +19,7 @@ declare quant_n_bits=8
 declare quant_group_size=128
 declare quant_start=500
 declare vast_api_key=""
-declare rclone_remote="box"
+declare rclone_remote="UCLA_box"
 
 #loop through the args
 for arg in "$@"

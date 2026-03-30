@@ -59,7 +59,6 @@ class CompressedLinear(nn.Module):
                 self.bias = None
 
         self.compressed = False
-        self.quantized = False
         self.grad_checkpoint = False
         self.verbose = verbose
         self.denormalization_method: Literal["otf", "reconstruct", "ignore"] = (

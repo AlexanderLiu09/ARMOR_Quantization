@@ -495,6 +495,7 @@ class ARMOR_Linear(CompressedLinear):
         if training_config.logfile is not None:
             os.makedirs(os.path.dirname(training_config.logfile), exist_ok=True)
         
+        
         quant_config = QuantConfig(training_config.quant_enabled,
                                    training_config.quant_n_bits,
                                    training_config.quant_group_size,
@@ -747,14 +748,22 @@ class ARMOR_Linear(CompressedLinear):
                             ):
         
 
-            
+        # print(kwargs)
         if normalizer is not None:
             self.normalizer = normalizer
         else:
             self.normalizer = normalize.Normalizer.blank_recreate(
                 self.original_weight, **normalizer_kwargs
             )
-        
+
+        # print(kwargs["training_config"])
+        training_config = instantiate(kwargs["training_config"])
+        quant_config = QuantConfig(training_config.quant_enabled,
+                                   training_config.quant_n_bits,
+                                   training_config.quant_group_size,
+                                   training_config.quant_symmetric,
+                                   training_config.quant_qat_start_iter)
+
         self.naive_compression_module = utils.blank_init(
             naive_compression_config,
             n_in = self.original_weight.shape[1],
@@ -762,7 +771,14 @@ class ARMOR_Linear(CompressedLinear):
             dtype=self.original_weight.dtype,
             device=self.original_weight.device,
         )
-        
+
+        if quant_config.enabled:
+            #TODO: Make this less ugly
+            self.naive_compression_module.quantize_sparse_values(quant_config.n_bits,
+                                                                             quant_config.group_size,
+                                                                             quant_config.symmetric) 
+            print("fake quantizing")
+
         if isinstance(block_diagonal_config.block_size, int):
             block_diagonal_config.block_size = (block_diagonal_config.block_size, block_diagonal_config.block_size)
         self.A = BlockwiseDiagMatrix(
@@ -817,11 +833,11 @@ if __name__ == "__main__":
         utils.seed(0)
         device = "cuda:0"
         print("current_directory:", os.getcwd())
-        model_name = "Qwen/Qwen2.5-7B"
+        model_name = "Qwen/Qwen3-8B"
         # weight_path = "/data/lliu/NoWAG/models/meta-llama/Llama-2-7b-hf/original_weights/layer_28/mlp.up_proj.pt"
         proj_name = "layer_0/self_attn.q_proj"
         weight_path = f"/data/lliu/LLM_data/{model_name}/original_weights/{proj_name}.pt"
-        hessian_diag = weight_path.replace("original_weights", "hessian_diag/SlimPajama-627B/n_samples_128_ctx_len_8192/seed_0")
+        hessian_diag = weight_path.replace("original_weights", "hessian_diag/fineweb-edu/n_samples_128_ctx_len_8192/seed_0")
 
         
         weight = torch.load(weight_path, map_location=device)["weight"].to(torch.float32).detach()
