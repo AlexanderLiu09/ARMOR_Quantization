@@ -153,19 +153,6 @@ def compression_worker(
                     os.path.join(cfg.temp_path, layer_name + ".pt"),
                     map_location=device
                 )
-                # If the checkpoint was quantized, manually assign the quantized
-                # buffers before loading the rest of the state dict
-                if "naive_compression_module.X_int" in state_dict:
-                    ncm = compression_module.naive_compression_module
-                    if hasattr(ncm, 'X'):
-                        del ncm.X
-                    ncm.register_buffer("X_int", state_dict.pop("naive_compression_module.X_int"))
-                    ncm.register_buffer("scale", state_dict.pop("naive_compression_module.scale"))
-                    ncm.register_buffer("zero_point", state_dict.pop("naive_compression_module.zero_point"))
-                    ncm.quantized = True
-                    ncm.quant_n_bits = cfg.compress.compression_config.training_config.quant_n_bits
-                    ncm.quant_group_size = cfg.compress.compression_config.training_config.quant_group_size
-                    ncm.quant_symmetric = cfg.compress.compression_config.training_config.quant_symmetric
                 compression_module.load_state_dict(state_dict, strict=False)
                 compression_module.to(original_dtype)
             else:
@@ -508,17 +495,6 @@ def main(cfg: DictConfig):
             state_dict = torch.load(save_path, map_location=orig_device)
             # If the checkpoint was quantized, the naive_compression_module will have
             # X_int/scale/zero_point instead of X. Prepare the module to match.
-            if "naive_compression_module.X_int" in state_dict:
-                ncm = layer.naive_compression_module
-                if hasattr(ncm, 'X'):
-                    del ncm.X
-                ncm.register_buffer("X_int", state_dict.pop("naive_compression_module.X_int"))
-                ncm.register_buffer("scale", state_dict.pop("naive_compression_module.scale"))
-                ncm.register_buffer("zero_point", state_dict.pop("naive_compression_module.zero_point"))
-                ncm.quantized = True
-                ncm.quant_n_bits = cfg.compress.compression_config.training_config.quant_n_bits
-                ncm.quant_group_size = cfg.compress.compression_config.training_config.quant_group_size
-                ncm.quant_symmetric = cfg.compress.compression_config.training_config.quant_symmetric
             layer.load_state_dict(state_dict, strict=False)
             layer.to(orig_dtype)
             # delete the state dict to save memory
