@@ -328,24 +328,18 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         B_selected = B[:, possible_non_zero_idxs, :] #shape of (n_blocks_total, n_possible, n_non_zero, block_size_1)
         B_squared = torch.bmm(B_selected.view(-1, n_nonzero, block_size_1),
                                 B_selected.view(-1,  n_nonzero, block_size_1).transpose(1, 2)) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
-        #add damping to the diagonal
-        B_squared += torch.eye(n_nonzero, device=B.device) * 1e-9 
+        #add relative damping to the diagonal
+        diag_mean = B_squared.diagonal(dim1=-2, dim2=-1).mean(dim=-1).view(-1, 1, 1)
+        B_squared += torch.eye(n_nonzero, device=B.device) * (diag_mean * 1e-4 + 1e-9)
         #get the inverse with cholesky
-
-
-        #B_squared_inv = torch.cholesky_inverse(torch.linalg.cholesky_ex(B_squared)[0]) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
         L, info = torch.linalg.cholesky_ex(B_squared)
         failed = (info != 0)
-        assert not failed.any(), f"[iter {iter_idx}] Cholesky failed for {failed.sum()} blocks, condition numbers: {torch.linalg.cond(B_squared[failed])}"
-
-        # if failed.any():
-        #     print(f"Cholesky failed for {failed.sum()} blocks, condition numbers: {torch.linalg.cond(B_squared[failed])}")
-        #     B_squared[failed] += torch.eye(n_nonzero, device=B.device) * 1e-3
-            
-        #     L_retry, failed_retry = torch.linalg.cholesky_ex(B_squared[failed])
-        #     assert not failed_retry.any(), "Cholesky_ex failed again, refer to condition numbers"
-            
-        #     L[failed] = L_retry
+        if failed.any():
+            print(f"[iter {iter_idx}] Cholesky failed for {failed.sum()} blocks, condition numbers: {torch.linalg.cond(B_squared[failed])}")
+            B_squared[failed] += torch.eye(n_nonzero, device=B.device) * 1e-3
+            L_retry, failed_retry = torch.linalg.cholesky_ex(B_squared[failed])
+            assert not failed_retry.any(), "Cholesky_ex failed again, refer to condition numbers"
+            L[failed] = L_retry
         B_squared_inv = torch.cholesky_inverse(L)
 
 
