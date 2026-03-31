@@ -16,7 +16,7 @@ import time
 import wandb
 from functools import partial # <-- Import partial
 from hydra.utils import instantiate
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 if __name__ == "__main__":
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from typing import Tuple, Optional, Union, List, Literal
@@ -758,26 +758,31 @@ class ARMOR_Linear(CompressedLinear):
 
         # print(kwargs["training_config"])
         training_config = instantiate(kwargs["training_config"])
-        quant_config = QuantConfig(training_config.quant_enabled,
-                                   training_config.quant_n_bits,
-                                   training_config.quant_group_size,
-                                   training_config.quant_symmetric,
-                                   training_config.quant_qat_start_iter)
 
-        self.naive_compression_module = utils.blank_init(
-            naive_compression_config,
-            n_in = self.original_weight.shape[1],
-            n_out = self.original_weight.shape[0],
-            dtype=self.original_weight.dtype,
-            device=self.original_weight.device,
-        )
+        if training_config.quant_enabled: 
+            print("Loading Quantized Weights")
+            naive_cfg = copy.deepcopy(naive_compression_config)
+            with open_dict(naive_cfg):
+                naive_cfg.init_config._target_ = "src.sparse_compress.QuantizedSparseLinear"
+                naive_cfg.compression_config.quant_n_bits = training_config.quant_n_bits
+                naive_cfg.compression_config.quant_group_size = training_config.quant_group_size
+                naive_cfg.compression_config.quant_symmetric = training_config.quant_symmetric
+            
+            self.naive_compression_module = utils.blank_init(
+                naive_cfg,
+                n_in = self.original_weight.shape[1],
+                n_out = self.original_weight.shape[0],
+                dtype=self.original_weight.dtype,
+                device=self.original_weight.device,)
 
-        if quant_config.enabled:
-            #TODO: Make this less ugly
-            self.naive_compression_module.quantize_sparse_values(quant_config.n_bits,
-                                                                             quant_config.group_size,
-                                                                             quant_config.symmetric) 
-            print("fake quantizing")
+        else:
+            print("Loading FP16 Weights")
+            self.naive_compression_module = utils.blank_init(
+                naive_compression_config,
+                n_in = self.original_weight.shape[1],
+                n_out = self.original_weight.shape[0],
+                dtype=self.original_weight.dtype,
+                device=self.original_weight.device,)
 
         if isinstance(block_diagonal_config.block_size, int):
             block_diagonal_config.block_size = (block_diagonal_config.block_size, block_diagonal_config.block_size)

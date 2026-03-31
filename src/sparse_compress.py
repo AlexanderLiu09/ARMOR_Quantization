@@ -371,3 +371,44 @@ class SparseLinear(compression_parent.CompressedLinear):
                     print(f"mask at non-zero indices: {self.sparse_mask[non_zero_idx_i, non_zero_idx_j:non_zero_idx_j + self.sparse_group]}")
                     print(f"mask is not correct, expected at most {self.n_non_zero_per_group} non-zero elements per group, got {mask_sum[mask_sum > self.n_non_zero_per_group]} non-zero elements")
                 raise SparseCheckError
+            
+class QuantizedSparseLinear(SparseLinear):
+    name = "QuantizedSparseLinear"
+    quantized = True
+
+    @torch.no_grad
+    def blank_recreate(self,
+        frac_nonzero: float = 0.1,
+        pattern: Optional[Tuple[int, int]] = None,
+        sparse_group: Optional[int] = None,
+        normalizer_kwargs: Optional[dict] = None,
+        normalizer: Optional[normalize.Normalizer] = None,
+        quant_n_bits: int = 8,
+        quant_group_size: int = 128,
+        quant_symmetric: bool = True,
+        **kwargs):
+        """Same as super().blank_recreate but instatiate quantized buffers instead
+        """
+
+        super().blank_recreate(frac_nonzero, pattern, sparse_group, 
+                               normalizer_kwargs, normalizer, **kwargs)
+        del self.X
+
+        n_nonzero_total = self.n_non_zero_per_group * self.get_n_original_parameters()// self.sparse_group
+        n_quant_goups = math.ceil(n_nonzero_total / quant_group_size)
+
+        self.register_buffer("X_int", torch.zeros(n_nonzero_total,
+                                                  dtype = torch.int8, #TODO int4
+                                                  device = self.original_weight.device))
+        self.register_buffer("scale", torch.ones(n_quant_goups,
+                                                  dtype = self.original_weight.dtype,
+                                                  device = self.original_weight.device))
+        self.register_buffer("zero_point", torch.tensor([], 
+                                                        device = self.original_weight.device))
+        
+        self.quant_n_bits = quant_n_bits
+        self.quant_group_size = quant_group_size
+        self.quant_symmetric = quant_symmetric
+
+
+
