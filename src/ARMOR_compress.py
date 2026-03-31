@@ -331,7 +331,18 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         #add damping to the diagonal
         B_squared += torch.eye(n_nonzero, device=B.device) * 1e-9 
         #get the inverse with cholesky
-        B_squared_inv = torch.cholesky_inverse(torch.linalg.cholesky_ex(B_squared)[0]) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
+
+
+        #B_squared_inv = torch.cholesky_inverse(torch.linalg.cholesky_ex(B_squared)[0]) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
+        L, info = torch.linalg.cholesky_ex(B_squared)
+        failed = (info != 0)
+        if failed.any():
+            print(f"Cholesky failed for {failed.sum()} blocks, condition numbers: {torch.linalg.cond(B_squared[failed])}")
+            B_squared[failed] += torch.eye(n_nonzero, device=B.device) * 1e-3
+            L[failed] = torch.linalg.cholesky_ex(B_squared[failed])[0]
+        B_squared_inv = torch.cholesky_inverse(L)
+
+
         #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
         first_order_selected = 1/2 * first_order_term[:, possible_non_zero_idxs] #shape of (n_blocks_total, n_possible, n_non_zero)
         first_order_selected = first_order_selected.view(n_blocks_total * n_possible, n_nonzero, 1) #shape of (n_blocks_total*n_possible, n_non_zero, 1)
