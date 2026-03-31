@@ -176,7 +176,7 @@ class SelectionConfig:
 def sparse_core_step(trainable_sparse: BlockCompressLearnable,
                             n_times: int = 1,
                             select: Literal["random", "gradient_greedy", "gradient_random"] = "random",
-                            )-> None:
+                            iter_idx: int = -1)-> None:
     
     
     """Performs n_times of discrete optimization on the sparse core of the compression module.
@@ -336,14 +336,16 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         #B_squared_inv = torch.cholesky_inverse(torch.linalg.cholesky_ex(B_squared)[0]) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
         L, info = torch.linalg.cholesky_ex(B_squared)
         failed = (info != 0)
-        if failed.any():
-            print(f"Cholesky failed for {failed.sum()} blocks, condition numbers: {torch.linalg.cond(B_squared[failed])}")
-            B_squared[failed] += torch.eye(n_nonzero, device=B.device) * 1e-3
+        assert not failed.any(), f"[iter {iter_idx}] Cholesky failed for {failed.sum()} blocks, condition numbers: {torch.linalg.cond(B_squared[failed])}"
+
+        # if failed.any():
+        #     print(f"Cholesky failed for {failed.sum()} blocks, condition numbers: {torch.linalg.cond(B_squared[failed])}")
+        #     B_squared[failed] += torch.eye(n_nonzero, device=B.device) * 1e-3
             
-            L_retry, failed_retry = torch.linalg.cholesky_ex(B_squared[failed])
-            assert not failed_retry.any(), "Cholesky_ex failed again, refer to condition numbers"
+        #     L_retry, failed_retry = torch.linalg.cholesky_ex(B_squared[failed])
+        #     assert not failed_retry.any(), "Cholesky_ex failed again, refer to condition numbers"
             
-            L[failed] = L_retry
+        #     L[failed] = L_retry
         B_squared_inv = torch.cholesky_inverse(L)
 
 
@@ -595,6 +597,7 @@ class ARMOR_Linear(CompressedLinear):
                         trainable_sparse,
                         n_times=training_config.n_sparse_core_updates_per_iter,
                         select=training_config.sparse_core_step_select,
+                        iter_idx=i
                     )
                     # raise ValueError("stop here, we are done with training")
             
