@@ -339,7 +339,11 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         if failed.any():
             print(f"Cholesky failed for {failed.sum()} blocks, condition numbers: {torch.linalg.cond(B_squared[failed])}")
             B_squared[failed] += torch.eye(n_nonzero, device=B.device) * 1e-3
-            L[failed] = torch.linalg.cholesky_ex(B_squared[failed])[0]
+            
+            L_retry, failed_retry = torch.linalg.cholesky_ex(B_squared[failed])
+            assert not failed_retry.any(), "Cholesky_ex failed again, refer to condition numbers"
+            
+            L[failed] = L_retry
         B_squared_inv = torch.cholesky_inverse(L)
 
 
