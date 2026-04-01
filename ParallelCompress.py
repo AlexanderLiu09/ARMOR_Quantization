@@ -292,6 +292,8 @@ def main(cfg: DictConfig):
         # raise ValueError("This script is not ready to run yet, please use the new compress.py script instead")
         # create our list of tasks
         weight_paths = glob.glob(os.path.join(cfg.weight_path, "*/*.pt"))
+        if cfg.layer_filter is not None:
+            weight_paths = [p for p in weight_paths if cfg.layer_filter in p]
         print("n weights found", len(weight_paths))
         
         #parse the datasets
