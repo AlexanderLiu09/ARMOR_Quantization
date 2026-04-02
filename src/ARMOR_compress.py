@@ -176,7 +176,7 @@ class SelectionConfig:
 def sparse_core_step(trainable_sparse: BlockCompressLearnable,
                             n_times: int = 1,
                             select: Literal["random", "gradient_greedy", "gradient_random"] = "random",
-                            iter_idx: int = -1)-> None:
+                            quant_config: Optional[QuantConfig] = None)-> None:
     
     
     """Performs n_times of discrete optimization on the sparse core of the compression module.
@@ -328,20 +328,10 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         B_selected = B[:, possible_non_zero_idxs, :] #shape of (n_blocks_total, n_possible, n_non_zero, block_size_1)
         B_squared = torch.bmm(B_selected.view(-1, n_nonzero, block_size_1),
                                 B_selected.view(-1,  n_nonzero, block_size_1).transpose(1, 2)) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
-        #add relative damping to the diagonal
-        #TODO simplify once training is stable
-        diag_mean = B_squared.diagonal(dim1=-2, dim2=-1).mean(dim=-1).view(-1, 1, 1)
-        B_squared += torch.eye(n_nonzero, device=B.device) * (diag_mean * 1e-4 + 1e-9)
+        #add damping to the diagonal
+        B_squared += torch.eye(n_nonzero, device=B.device) * 1e-6
         #get the inverse with cholesky
-        L, info = torch.linalg.cholesky_ex(B_squared)
-        failed = (info != 0)
-        if failed.any():
-            print(f"[iter {iter_idx}] Cholesky failed for {failed.sum()} blocks, condition numbers: {torch.linalg.cond(B_squared[failed])}")
-            B_squared[failed] += torch.eye(n_nonzero, device=B.device) * 1e-3
-            L_retry, failed_retry = torch.linalg.cholesky_ex(B_squared[failed])
-            assert not failed_retry.any(), "Cholesky_ex failed again, refer to condition numbers"
-            L[failed] = L_retry
-        B_squared_inv = torch.cholesky_inverse(L)
+        B_squared_inv = torch.cholesky_inverse(torch.linalg.cholesky_ex(B_squared)[0]) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
 
 
         #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
@@ -387,6 +377,9 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         sparse_values = -torch.bmm(B_inv_optimal, first_order_optimal).squeeze(2) #shape of (n_blocks_total, n_non_zero)
         #now scale by square of a's norm
         sparse_values = sparse_values / (torch.sum(a**2, dim = 1, keepdim = True) + trainable_sparse.eps) #shape of (n_blocks_total, n_non_zero)
+        #snap sparse values to the quantization grid if QAT is active
+        if quant_config is not None and quant_config.enabled:
+            sparse_values = fake_quantize(sparse_values, quant_config.n_bits, quant_config.group_size, quant_config.symmetric)
         #update the sparse values
         trainable_sparse.naive_compression_module.X.data[group_idxs[:,0].unsqueeze(1),
                                                         optimal_non_zero_idxs + group_idxs[:,1].unsqueeze(1)] = sparse_values #shape of (n_blocks_total, n_non_zero)
@@ -586,13 +579,13 @@ class ARMOR_Linear(CompressedLinear):
                 optimizer.step()
                     
 
-            if training_config.n_sparse_core_updates_per_iter != 0 and not (i >= quant_config.qat_start_iter and quant_config.enabled):
+            if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
                     sparse_core_step(
                         trainable_sparse,
                         n_times=training_config.n_sparse_core_updates_per_iter,
                         select=training_config.sparse_core_step_select,
-                        iter_idx=i
+                        quant_config=quant_config if i >= quant_config.qat_start_iter else None,
                     )
                     # raise ValueError("stop here, we are done with training")
             
