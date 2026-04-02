@@ -329,6 +329,7 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         B_squared = torch.bmm(B_selected.view(-1, n_nonzero, block_size_1),
                                 B_selected.view(-1,  n_nonzero, block_size_1).transpose(1, 2)) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
         #add relative damping to the diagonal
+        #TODO simplify once training is stable
         diag_mean = B_squared.diagonal(dim1=-2, dim2=-1).mean(dim=-1).view(-1, 1, 1)
         B_squared += torch.eye(n_nonzero, device=B.device) * (diag_mean * 1e-4 + 1e-9)
         #get the inverse with cholesky
@@ -585,7 +586,7 @@ class ARMOR_Linear(CompressedLinear):
                 optimizer.step()
                     
 
-            if training_config.n_sparse_core_updates_per_iter != 0:
+            if training_config.n_sparse_core_updates_per_iter != 0 and not (i >= quant_config.qat_start_iter and quant_config.enabled):
                 with torch.no_grad():
                     sparse_core_step(
                         trainable_sparse,
