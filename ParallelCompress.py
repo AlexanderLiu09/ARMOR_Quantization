@@ -293,7 +293,8 @@ def main(cfg: DictConfig):
         # create our list of tasks
         weight_paths = glob.glob(os.path.join(cfg.weight_path, "*/*.pt"))
         if cfg.layer_filter is not None:
-            weight_paths = [p for p in weight_paths if cfg.layer_filter in p]
+            filters = [f.strip() for f in cfg.layer_filter.split(",")]
+            weight_paths = [p for p in weight_paths if any(f in p for f in filters)]
         print("n weights found", len(weight_paths))
         
         #parse the datasets
