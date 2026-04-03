@@ -845,7 +845,8 @@ class ARMOR_Linear(CompressedLinear):
         
 #testing main fn 
 if __name__ == "__main__":
-    @hydra.main(config_path="../config/compress", config_name="ARMOR")
+    #@hydra.main(config_path="../config/compress", config_name="ARMOR")
+    @hydra.main(config_path="../config/compress", config_name="ARMOR_quantized")
     def testing_main(cfg: DictConfig):
         utils.seed(0)
         device = "cuda:0"
@@ -853,7 +854,7 @@ if __name__ == "__main__":
         model_name = "Qwen/Qwen3-8B"
         # weight_path = "/data/lliu/NoWAG/models/meta-llama/Llama-2-7b-hf/original_weights/layer_28/mlp.up_proj.pt"
         proj_name = "layer_0/self_attn.q_proj"
-        weight_path = f"/data/lliu/LLM_data/{model_name}/original_weights/{proj_name}.pt"
+        weight_path = f"/workspace/LLM_data/{model_name}/original_weights/{proj_name}.pt"
         hessian_diag = weight_path.replace("original_weights", "hessian_diag/fineweb-edu/n_samples_128_ctx_len_8192/seed_0")
 
         
