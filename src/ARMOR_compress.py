@@ -383,6 +383,15 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         sparse_values = -torch.bmm(B_inv_optimal, first_order_optimal).squeeze(2) #shape of (n_blocks_total, n_non_zero)
         #now scale by square of a's norm
         sparse_values = sparse_values / (torch.sum(a**2, dim = 1, keepdim = True) + trainable_sparse.eps) #shape of (n_blocks_total, n_non_zero)
+        # DEBUG: warn when sparse values or a norms look anomalous
+        a_sq_norms = torch.sum(a**2, dim=1)
+        if sparse_values.abs().max().item() > 1e6 or a_sq_norms.min().item() < 1e-6:
+            print(f"  [sparse_core_step WARNING] sparse_values abs_max={sparse_values.abs().max().item():.6e}")
+            print(f"  a squared norms: min={a_sq_norms.min().item():.6e}, max={a_sq_norms.max().item():.6e}")
+            print(f"  B_inv_optimal abs_max={B_inv_optimal.abs().max().item():.6e}")
+            print(f"  first_order_optimal abs_max={first_order_optimal.abs().max().item():.6e}")
+            print(f"  diag_mean range: {diag_mean.min().item():.6e} to {diag_mean.max().item():.6e}")
+            print(f"  cholesky failures: {(info != 0).sum().item()}")
         #snap sparse values to the quantization grid if QAT is active
         if quant_config is not None and quant_config.enabled:
             sparse_values = fake_quantize(sparse_values, quant_config.n_bits, quant_config.group_size, quant_config.symmetric)
@@ -594,8 +603,30 @@ class ARMOR_Linear(CompressedLinear):
                         quant_config=quant_config if i >= quant_config.qat_start_iter else None,
                     )
                     # raise ValueError("stop here, we are done with training")
-            
-            
+
+                # DEBUG: iteration-aware diagnostics near divergence window
+                if i >= 1700 and i % 50 == 0:
+                    S = trainable_sparse.naive_compression_module.reconstruct()
+                    recon = trainable_sparse()
+                    print(f"\n=== DIAGNOSTIC iter {i} ===")
+                    print(f"  loss: {trainable_sparse.recon_loss(reduction='mean').item():.6e}")
+                    print(f"  S (sparse core): abs_max={S.abs().max().item():.6e}, "
+                          f"mean={S.mean().item():.6e}, std={S.std().item():.6e}, "
+                          f"has_nan={S.isnan().any().item()}, has_inf={S.isinf().any().item()}")
+                    print(f"  A diag_blocks: abs_max={trainable_sparse.A.diag_blocks.abs().max().item():.6e}, "
+                          f"min_norm={torch.norm(trainable_sparse.A.diag_blocks, dim=-1).min().item():.6e}")
+                    print(f"  B diag_blocks: abs_max={trainable_sparse.B.diag_blocks.abs().max().item():.6e}, "
+                          f"min_norm={torch.norm(trainable_sparse.B.diag_blocks, dim=-1).min().item():.6e}")
+                    print(f"  recon weight: abs_max={recon.abs().max().item():.6e}, "
+                          f"has_nan={recon.isnan().any().item()}, has_inf={recon.isinf().any().item()}")
+                    print(f"  X (underlying): abs_max={trainable_sparse.naive_compression_module.X.abs().max().item():.6e}")
+                    print(f"=== END DIAGNOSTIC ===\n")
+
+                if i == 1800:
+                    print("STOP: iter 1800 reached -- inspect diagnostics above")
+                    raise ValueError("Stopped at iter 1800 for inspection")
+
+
             #loss stuff
             with torch.no_grad():
                 current_loss = trainable_sparse.recon_loss(reduction="mean").item()
