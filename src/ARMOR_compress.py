@@ -414,7 +414,16 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
                         denorm_factor = denorm_factor * norm[rows].unsqueeze(1)
 
             sparse_values_denorm = sparse_values * denorm_factor
-            sparse_values_denorm = fake_quantize(sparse_values_denorm, quant_config.n_bits, quant_config.group_size, quant_config.symmetric)
+            # Use n_nonzero as group_size so each block's values form their own
+            # quantization group. With group_size=128 (default), values from blocks
+            # with very different denorm factors would share a group -- the scale
+            # is set by the largest value, zeroing out smaller ones, and dividing
+            # by a small denorm_factor then amplifies the error catastrophically.
+            # n_nonzero (e.g. 2 for 2:4 sparsity) keeps same-row, same-block
+            # values together where denorm factors are similar.
+            sparse_values_denorm = fake_quantize(sparse_values_denorm, quant_config.n_bits,
+                                                  group_size=n_nonzero,
+                                                  symmetric=quant_config.symmetric)
             sparse_values = sparse_values_denorm / denorm_factor
         #update the sparse values
         trainable_sparse.naive_compression_module.X.data[group_idxs[:,0].unsqueeze(1),
