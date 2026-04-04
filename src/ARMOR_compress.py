@@ -393,8 +393,29 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
             print(f"  diag_mean range: {diag_mean.min().item():.6e} to {diag_mean.max().item():.6e}")
             print(f"  cholesky failures: {(info != 0).sum().item()}")
         #snap sparse values to the quantization grid if QAT is active
+        #NOTE: sparse_values are in normalized space (they get written to X.data),
+        #but at inference time, quantization happens in denormalized space
+        #(BlockCompressLearnable.forward quantizes after reconstruct() which denormalizes).
+        #So we must denormalize -> quantize -> renormalize to match inference behavior.
         if quant_config is not None and quant_config.enabled:
-            sparse_values = fake_quantize(sparse_values, quant_config.n_bits, quant_config.group_size, quant_config.symmetric)
+            naive_normalizer = trainable_sparse.naive_compression_module.normalizer
+            rows = group_idxs[:, 0]  # (n_blocks_total,)
+            cols = optimal_non_zero_idxs + group_idxs[:, 1].unsqueeze(1)  # (n_blocks_total, n_nonzero)
+
+            # compute per-element denormalization factor (multiplicative only)
+            denorm_factor = torch.ones_like(sparse_values)
+            for j_norm in reversed(range(len(naive_normalizer.norm_order))):
+                dim = naive_normalizer.norm_order[j_norm]
+                norm = naive_normalizer.norms[j_norm]
+                if norm is not None and norm.numel() > 0:
+                    if dim == 0:  # column norm, indexed by col
+                        denorm_factor = denorm_factor * norm[cols]
+                    elif dim == 1:  # row norm, indexed by row
+                        denorm_factor = denorm_factor * norm[rows].unsqueeze(1)
+
+            sparse_values_denorm = sparse_values * denorm_factor
+            sparse_values_denorm = fake_quantize(sparse_values_denorm, quant_config.n_bits, quant_config.group_size, quant_config.symmetric)
+            sparse_values = sparse_values_denorm / denorm_factor
         #update the sparse values
         trainable_sparse.naive_compression_module.X.data[group_idxs[:,0].unsqueeze(1),
                                                         optimal_non_zero_idxs + group_idxs[:,1].unsqueeze(1)] = sparse_values #shape of (n_blocks_total, n_non_zero)
