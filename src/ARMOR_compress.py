@@ -44,7 +44,7 @@ class BlockCompressLearnable(nn.Module):
     def __init__(self, original_weight: torch.FloatTensor, 
                  naive_compression_module: CompressedLinear,
                  block_size: Union[int, Tuple[int, int]],
-                 importance_weight: Optional[torch.FloatTensor] = None,
+                 importance_weight: Optional[torch.FloatTensor] = None,              
     ) -> None:
         """Initializes the PermutedSparseWeight class.
 
@@ -174,6 +174,7 @@ class SelectionConfig:
 
 @torch.no_grad()         
 def sparse_core_step(trainable_sparse: BlockCompressLearnable,
+                            init_loss: float,
                             n_times: int = 1,
                             select: Literal["random", "gradient_greedy", "gradient_random"] = "random",
                             quant_config: Optional[QuantConfig] = None)-> None:
@@ -428,7 +429,13 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         #update the sparse values
         trainable_sparse.naive_compression_module.X.data[group_idxs[:,0].unsqueeze(1),
                                                         optimal_non_zero_idxs + group_idxs[:,1].unsqueeze(1)] = sparse_values #shape of (n_blocks_total, n_non_zero)
-            
+        
+        final_loss = trainable_sparse.recon_loss().item() 
+        print (f"----------------------------LOSS AFTER SPARSE CORE STEP {j}: {final_loss}------------------------")   
+        if final_loss > 1.01*init_loss:
+            raise ValueError("Spaese core step increased loss by over 1%")
+        else:
+            init_loss = final_loss
         
         
                 
@@ -623,7 +630,10 @@ class ARMOR_Linear(CompressedLinear):
                 #step the optimizers
                 optimizer.step()
                     
-
+            #NOTE: debug statements to make sure that loss is decreasing after sparse core step
+            print(f"--------------------LOSS BEFORE SPARSE CORE STEP @ ITER {i}---------------")
+            print(f"--------------------LOSS VALUE: {loss.item()}-----------------------------")
+            
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
                     sparse_core_step(
@@ -914,7 +924,7 @@ if __name__ == "__main__":
         print("current_directory:", os.getcwd())
         model_name = "Qwen/Qwen3-8B"
         # weight_path = "/data/lliu/NoWAG/models/meta-llama/Llama-2-7b-hf/original_weights/layer_28/mlp.up_proj.pt"
-        proj_name = "layer_0/self_attn.q_proj"
+        proj_name = "layer_1/self_attn.q_proj"
         weight_path = f"/workspace/LLM_data/{model_name}/original_weights/{proj_name}.pt"
         hessian_diag = weight_path.replace("original_weights", "hessian_diag/fineweb-edu/n_samples_128_ctx_len_8192/seed_0")
 
