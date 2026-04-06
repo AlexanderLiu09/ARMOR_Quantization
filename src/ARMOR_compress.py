@@ -433,7 +433,7 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         
         if print_this_iter:
             final_loss = trainable_sparse.recon_loss().item() 
-            print (f"----------------------------LOSS AFTER SPARSE CORE STEP {j}: {final_loss}------------------------")   
+            print (f"----------------------------LOSS AFTER SPARSE CORE STEP {i}: {final_loss}------------------------")   
             if final_loss > 1.01*init_loss:
                 raise ValueError("Spaese core step increased loss by over 1%")
             else:
@@ -540,6 +540,7 @@ class ARMOR_Linear(CompressedLinear):
         block_diagonal_config: DictConfig,
         optimizer_config: DictConfig,
         training_config: DictConfig,
+        lr_scheduler_config: Optional[DictConfig] = None,
         normalizer: Optional[normalize.Normalizer] = None,
         normalizer_kwargs: Optional[dict] = None,
         training_config_overrides: Optional[dict] = {},
@@ -598,8 +599,12 @@ class ARMOR_Linear(CompressedLinear):
             trainable_sparse=trainable_sparse,
             optimizer_config=optimizer_config,
         )
-            
-        
+
+        #create the lr scheduler if configured
+        lr_scheduler = None
+        if lr_scheduler_config is not None:
+            lr_scheduler = instantiate(lr_scheduler_config, optimizer=optimizer)
+
         start_time = time.time()
         #create a simple logger
         with torch.no_grad():
@@ -633,7 +638,9 @@ class ARMOR_Linear(CompressedLinear):
                 loss.backward()
                 #step the optimizers
                 optimizer.step()
-                    
+                if lr_scheduler is not None:
+                    lr_scheduler.step()
+
             #NOTE: debug statements to make sure that loss is decreasing after sparse core step
             if i > 500 and i % 50 == 0:
                 print_this_iter = True
@@ -644,7 +651,7 @@ class ARMOR_Linear(CompressedLinear):
                 with torch.no_grad():
                     sparse_core_step(
                         trainable_sparse,
-                        last_continous_loss,
+                        last_continous_loss if print_this_iter else None,
                         print_this_iter,
                         n_times=training_config.n_sparse_core_updates_per_iter,
                         select=training_config.sparse_core_step_select,
@@ -692,7 +699,8 @@ class ARMOR_Linear(CompressedLinear):
             # )
                 
             if i%training_config.log_freq == training_config.log_freq-1 or i==0:
-                log_str = f"Iter: {i}, Loss: {current_loss}"
+                current_lr = optimizer.param_groups[0]['lr']
+                log_str = f"Iter: {i}, Loss: {current_loss}, LR: {current_lr:.2e}"
                 if self.verbose:
                     print(log_str)
                 if self.use_wandb:
@@ -760,11 +768,12 @@ class ARMOR_Linear(CompressedLinear):
         self.naive_compression_module.compress_sparse_values()
         self.compressed = True
         
-    def compress(self, 
+    def compress(self,
                naive_compression_config: DictConfig,
         block_diagonal_config: DictConfig,
         optimizer_config: DictConfig,
         training_config: DictConfig,
+        lr_scheduler_config: Optional[DictConfig] = None,
         normalizer: Optional[normalize.Normalizer] = None,
         normalizer_kwargs: Optional[dict] = None,
         training_config_overrides: Optional[dict] = {},
@@ -775,6 +784,7 @@ class ARMOR_Linear(CompressedLinear):
             block_diagonal_config = block_diagonal_config,
             optimizer_config = optimizer_config,
             training_config = training_config,
+            lr_scheduler_config = lr_scheduler_config,
             normalizer = normalizer,
             normalizer_kwargs = normalizer_kwargs,
             training_config_overrides = training_config_overrides,

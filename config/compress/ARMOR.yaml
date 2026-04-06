@@ -18,6 +18,11 @@ compression_config:
     lr: 0.0001
     # weight_decay: 0.001
 
+  lr_scheduler_config:
+    _target_: "torch.optim.lr_scheduler.CosineAnnealingLR"
+    T_max: ${..training_config.n_iters}
+    eta_min: 1.0e-6
+
   training_config:
     _target_: "src.ARMOR_compress.TrainingConfig"
     n_iters: 3000
