@@ -175,6 +175,7 @@ class SelectionConfig:
 @torch.no_grad()         
 def sparse_core_step(trainable_sparse: BlockCompressLearnable,
                             init_loss: float,
+                            print_this_iter: bool,
                             n_times: int = 1,
                             select: Literal["random", "gradient_greedy", "gradient_random"] = "random",
                             quant_config: Optional[QuantConfig] = None)-> None:
@@ -430,12 +431,13 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         trainable_sparse.naive_compression_module.X.data[group_idxs[:,0].unsqueeze(1),
                                                         optimal_non_zero_idxs + group_idxs[:,1].unsqueeze(1)] = sparse_values #shape of (n_blocks_total, n_non_zero)
         
-        final_loss = trainable_sparse.recon_loss().item() 
-        print (f"----------------------------LOSS AFTER SPARSE CORE STEP {j}: {final_loss}------------------------")   
-        if final_loss > 1.01*init_loss:
-            raise ValueError("Spaese core step increased loss by over 1%")
-        else:
-            init_loss = final_loss
+        if print_this_iter:
+            final_loss = trainable_sparse.recon_loss().item() 
+            print (f"----------------------------LOSS AFTER SPARSE CORE STEP {j}: {final_loss}------------------------")   
+            if final_loss > 1.01*init_loss:
+                raise ValueError("Spaese core step increased loss by over 1%")
+            else:
+                init_loss = final_loss
         
         
                 
@@ -612,6 +614,8 @@ class ARMOR_Linear(CompressedLinear):
             
         remaining_patience = training_config.overall_patience
         for i in tqdm.tqdm(range(training_config.n_iters), disable = not self.verbose):
+            #NOTE: for debug
+            print_this_iter = False
             
             #optimizer step
             for j in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
@@ -631,14 +635,17 @@ class ARMOR_Linear(CompressedLinear):
                 optimizer.step()
                     
             #NOTE: debug statements to make sure that loss is decreasing after sparse core step
-            print(f"--------------------LOSS BEFORE SPARSE CORE STEP @ ITER {i}---------------")
-            print(f"--------------------LOSS VALUE: {loss.item()}-----------------------------")
+            if i > 500 and i % 50 == 0:
+                print_this_iter = True
+                last_continous_loss = loss.item()
+                print(f"--------------------LOSS BEFORE SPARSE CORE STEP @ ITER {i}: {last_continous_loss}---------------")
             
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
                     sparse_core_step(
                         trainable_sparse,
-                        loss.item(),
+                        last_continous_loss,
+                        print_this_iter,
                         n_times=training_config.n_sparse_core_updates_per_iter,
                         select=training_config.sparse_core_step_select,
                         quant_config=quant_config if i >= quant_config.qat_start_iter else None,
