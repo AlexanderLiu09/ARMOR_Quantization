@@ -638,6 +638,7 @@ class ARMOR_Linear(CompressedLinear):
                 with torch.no_grad():
                     sparse_core_step(
                         trainable_sparse,
+                        loss.item(),
                         n_times=training_config.n_sparse_core_updates_per_iter,
                         select=training_config.sparse_core_step_select,
                         quant_config=quant_config if i >= quant_config.qat_start_iter else None,
