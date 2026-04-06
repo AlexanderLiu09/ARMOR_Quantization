@@ -15,7 +15,7 @@ compression_config:
 
   optimizer_config:
     _target_: "torch.optim.Adam"
-    lr: 0.0001
+    lr: 0.00003   # was 0.0001 -- starting lr for cosine must be ≤ known-safe value
     # weight_decay: 0.001
 
   lr_scheduler_config:
