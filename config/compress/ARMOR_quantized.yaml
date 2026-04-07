@@ -5,7 +5,7 @@ defaults:
 compression_config:
   training_config:
     quant_enabled: true
-    quant_n_bits: 8
+    quant_n_bits: 4
     quant_group_size: 128
     quant_symmetric: true
     quant_qat_start_iter: 500
