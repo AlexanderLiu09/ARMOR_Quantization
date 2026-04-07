@@ -387,13 +387,13 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         sparse_values = sparse_values / (torch.sum(a**2, dim = 1, keepdim = True) + trainable_sparse.eps) #shape of (n_blocks_total, n_non_zero)
         # DEBUG: warn when sparse values or a norms look anomalous
         a_sq_norms = torch.sum(a**2, dim=1)
-        if sparse_values.abs().max().item() > 1e6 or a_sq_norms.min().item() < 1e-6:
-            print(f"  [sparse_core_step WARNING] sparse_values abs_max={sparse_values.abs().max().item():.6e}")
-            print(f"  a squared norms: min={a_sq_norms.min().item():.6e}, max={a_sq_norms.max().item():.6e}")
-            print(f"  B_inv_optimal abs_max={B_inv_optimal.abs().max().item():.6e}")
-            print(f"  first_order_optimal abs_max={first_order_optimal.abs().max().item():.6e}")
-            print(f"  diag_mean range: {diag_mean.min().item():.6e} to {diag_mean.max().item():.6e}")
-            print(f"  cholesky failures: {(info != 0).sum().item()}")
+        # if sparse_values.abs().max().item() > 1e6 or a_sq_norms.min().item() < 1e-6:
+        #     print(f"  [sparse_core_step WARNING] sparse_values abs_max={sparse_values.abs().max().item():.6e}")
+        #     print(f"  a squared norms: min={a_sq_norms.min().item():.6e}, max={a_sq_norms.max().item():.6e}")
+        #     print(f"  B_inv_optimal abs_max={B_inv_optimal.abs().max().item():.6e}")
+        #     print(f"  first_order_optimal abs_max={first_order_optimal.abs().max().item():.6e}")
+        #     print(f"  diag_mean range: {diag_mean.min().item():.6e} to {diag_mean.max().item():.6e}")
+        #     print(f"  cholesky failures: {(info != 0).sum().item()}")
         #snap sparse values to the quantization grid if QAT is active
         #NOTE: sparse_values are in normalized space (they get written to X.data),
         #but at inference time, quantization happens in denormalized space
@@ -433,11 +433,13 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         
         if print_this_iter:
             final_loss = trainable_sparse.recon_loss().item() 
-            print (f"----------------------------LOSS AFTER SPARSE CORE STEP {i}: {final_loss}------------------------")   
-            if final_loss > 1.01*init_loss:
-                raise ValueError("Spaese core step increased loss by over 1%")
-            else:
-                init_loss = final_loss
+            #print (f"----------------------------LOSS AFTER SPARSE CORE STEP {i}: {final_loss}------------------------")   
+            print(f"Sparse step decreased loss: {final_loss < init_loss}")
+            init_loss = final_loss
+            # if final_loss > 1.01*init_loss:
+            #     raise ValueError("Sparse core step increased loss by over 1%")
+            # else:
+            #     init_loss = final_loss
         
         
                 
@@ -622,6 +624,10 @@ class ARMOR_Linear(CompressedLinear):
             #NOTE: for debug
             print_this_iter = False
             
+            if quant_config is not None and i == quant_config.qat_start_iter:
+                remaining_patience = training_config.overall_patience
+                prev_iter_loss = trainable_sparse.recon_loss(reduction="mean").item()
+            
             #optimizer step
             for j in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
                 
@@ -645,7 +651,7 @@ class ARMOR_Linear(CompressedLinear):
             if i > 500 and i % 50 == 0:
                 print_this_iter = True
                 last_continous_loss = loss.item()
-                print(f"--------------------LOSS BEFORE SPARSE CORE STEP @ ITER {i}: {last_continous_loss}---------------")
+                # print(f"--------------------LOSS BEFORE SPARSE CORE STEP @ ITER {i}: {last_continous_loss}---------------")
             
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
@@ -660,26 +666,26 @@ class ARMOR_Linear(CompressedLinear):
                     # raise ValueError("stop here, we are done with training")
 
                 # DEBUG: iteration-aware diagnostics near divergence window
-                if i >= 1700 and i % 50 == 0:
-                    S = trainable_sparse.naive_compression_module.reconstruct()
-                    recon = trainable_sparse()
-                    print(f"\n=== DIAGNOSTIC iter {i} ===")
-                    print(f"  loss: {trainable_sparse.recon_loss(reduction='mean').item():.6e}")
-                    print(f"  S (sparse core): abs_max={S.abs().max().item():.6e}, "
-                          f"mean={S.mean().item():.6e}, std={S.std().item():.6e}, "
-                          f"has_nan={S.isnan().any().item()}, has_inf={S.isinf().any().item()}")
-                    print(f"  A diag_blocks: abs_max={trainable_sparse.A.diag_blocks.abs().max().item():.6e}, "
-                          f"min_norm={torch.norm(trainable_sparse.A.diag_blocks, dim=-1).min().item():.6e}")
-                    print(f"  B diag_blocks: abs_max={trainable_sparse.B.diag_blocks.abs().max().item():.6e}, "
-                          f"min_norm={torch.norm(trainable_sparse.B.diag_blocks, dim=-1).min().item():.6e}")
-                    print(f"  recon weight: abs_max={recon.abs().max().item():.6e}, "
-                          f"has_nan={recon.isnan().any().item()}, has_inf={recon.isinf().any().item()}")
-                    print(f"  X (underlying): abs_max={trainable_sparse.naive_compression_module.X.abs().max().item():.6e}")
-                    print(f"=== END DIAGNOSTIC ===\n")
+                # if i >= 1700 and i % 50 == 0:
+                #     S = trainable_sparse.naive_compression_module.reconstruct()
+                #     recon = trainable_sparse()
+                #     print(f"\n=== DIAGNOSTIC iter {i} ===")
+                #     print(f"  loss: {trainable_sparse.recon_loss(reduction='mean').item():.6e}")
+                #     print(f"  S (sparse core): abs_max={S.abs().max().item():.6e}, "
+                #           f"mean={S.mean().item():.6e}, std={S.std().item():.6e}, "
+                #           f"has_nan={S.isnan().any().item()}, has_inf={S.isinf().any().item()}")
+                #     print(f"  A diag_blocks: abs_max={trainable_sparse.A.diag_blocks.abs().max().item():.6e}, "
+                #           f"min_norm={torch.norm(trainable_sparse.A.diag_blocks, dim=-1).min().item():.6e}")
+                #     print(f"  B diag_blocks: abs_max={trainable_sparse.B.diag_blocks.abs().max().item():.6e}, "
+                #           f"min_norm={torch.norm(trainable_sparse.B.diag_blocks, dim=-1).min().item():.6e}")
+                #     print(f"  recon weight: abs_max={recon.abs().max().item():.6e}, "
+                #           f"has_nan={recon.isnan().any().item()}, has_inf={recon.isinf().any().item()}")
+                #     print(f"  X (underlying): abs_max={trainable_sparse.naive_compression_module.X.abs().max().item():.6e}")
+                #     print(f"=== END DIAGNOSTIC ===\n")
 
-                if i == 1800:
-                    print("STOP: iter 1800 reached -- inspect diagnostics above")
-                    raise ValueError("Stopped at iter 1800 for inspection")
+                # if i == 1800:
+                #     print("STOP: iter 1800 reached -- inspect diagnostics above")
+                #     raise ValueError("Stopped at iter 1800 for inspection")
 
 
             #loss stuff
