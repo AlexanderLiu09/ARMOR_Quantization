@@ -709,8 +709,8 @@ class ARMOR_Linear(CompressedLinear):
                     print(log_str)
                 if self.use_wandb:
                     log = {self.metric_name: current_loss,
-                           "loss/before_cont": loss_before_continous,
-                           "loss/after_cont": loss_after_continous,
+                           "change/from_cont": loss_after_continous - loss_before_continous,
+                           "loss/from_discrete": current_loss - loss_after_continous,
                            self.step_metric: i+1}
                     if self.direct_wandb_log:
                         wandb.log(log)
