@@ -628,13 +628,15 @@ class ARMOR_Linear(CompressedLinear):
                 remaining_patience = training_config.overall_patience
                 prev_iter_loss = trainable_sparse.recon_loss(reduction="mean").item()
             
+            #NOTE for debug
+            loss_before_continous = trainable_sparse.recon_loss(reduction="mean").item()
             #optimizer step
             for j in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
                 
                 #reset the optimizers
                 optimizer.zero_grad()   
                 
-                if i >= quant_config.qat_start_iter and quant_config.enabled:
+                if quant_config is not None and i >= quant_config.qat_start_iter and quant_config.enabled:
                     recon_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=quant_config)
                 else:
                     recon_loss = trainable_sparse.recon_loss(reduction="mean")
@@ -647,17 +649,13 @@ class ARMOR_Linear(CompressedLinear):
                 if lr_scheduler is not None:
                     lr_scheduler.step()
 
-            #NOTE: debug statements to make sure that loss is decreasing after sparse core step
-            if i > 500 and i % 50 == 0:
-                print_this_iter = True
-                last_continous_loss = loss.item()
-                # print(f"--------------------LOSS BEFORE SPARSE CORE STEP @ ITER {i}: {last_continous_loss}---------------")
+            loss_after_continous = trainable_sparse.recon_loss(reduction="mean").item()
             
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
                     sparse_core_step(
                         trainable_sparse,
-                        last_continous_loss if print_this_iter else None,
+                        None,
                         print_this_iter,
                         n_times=training_config.n_sparse_core_updates_per_iter,
                         select=training_config.sparse_core_step_select,
@@ -711,6 +709,8 @@ class ARMOR_Linear(CompressedLinear):
                     print(log_str)
                 if self.use_wandb:
                     log = {self.metric_name: current_loss,
+                           "loss/before_cont": loss_before_continous,
+                           "loss/after_cont": loss_after_continous,
                            self.step_metric: i+1}
                     if self.direct_wandb_log:
                         wandb.log(log)
