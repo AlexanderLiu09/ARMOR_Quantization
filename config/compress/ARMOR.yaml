@@ -15,12 +15,12 @@ compression_config:
 
   W_optimizer_config:
     _target_: "torch.optim.Adam"
-    W_lr: 5e-6   # was 0.0001 -- starting lr for cosine must be ≤ known-safe value
+    lr: 5e-6   # was 0.0001 -- starting lr for cosine must be ≤ known-safe value
     # weight_decay: 0.001
   
   AB_optimizer_config:
     _target_: "torch.optim.Adam"
-    AB_lr: 0.0001
+    lr: 0.0001
 
   lr_scheduler_config:
     _target_: "torch.optim.lr_scheduler.CosineAnnealingLR"
