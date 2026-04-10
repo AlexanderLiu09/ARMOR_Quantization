@@ -823,7 +823,7 @@ class ARMOR_Linear(CompressedLinear):
             naive_compression_config = naive_compression_config,
             block_diagonal_config = block_diagonal_config,
             W_optimizer_config = W_optimizer_config,
-            AB_optimzer_config = AB_optimzer_config,
+            AB_optimzer_config = AB_optimizer_config,
             training_config = training_config,
             lr_scheduler_config = lr_scheduler_config,
             normalizer = normalizer,
