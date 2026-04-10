@@ -551,7 +551,8 @@ class ARMOR_Linear(CompressedLinear):
         self,
         naive_compression_config: DictConfig,
         block_diagonal_config: DictConfig,
-        optimizer_config: DictConfig,
+        W_optimizer_config: DictConfig,
+        AB_optimizer_config: DictConfig,
         training_config: DictConfig,
         lr_scheduler_config: Optional[DictConfig] = None,
         normalizer: Optional[normalize.Normalizer] = None,
@@ -614,11 +615,11 @@ class ARMOR_Linear(CompressedLinear):
         # )
 
         W_optimizer = initialize_optimizer(trainable_sparse=trainable_sparse,
-                                          optimizer_config=optimizer_config,
+                                          optimizer_config=W_optimizer_config,
                                           type = "core")
         
         AB_optimizer = initialize_optimizer(trainable_sparse=trainable_sparse,
-                                           optimizer_config=optimizer_config,
+                                           optimizer_config=AB_optimizer_config,
                                            type = "wrapper")
 
         #create the lr scheduler if configured
@@ -809,7 +810,8 @@ class ARMOR_Linear(CompressedLinear):
     def compress(self,
                naive_compression_config: DictConfig,
         block_diagonal_config: DictConfig,
-        optimizer_config: DictConfig,
+        W_optimizer_config: DictConfig,
+        AB_optimzer_config: DictConfig,
         training_config: DictConfig,
         lr_scheduler_config: Optional[DictConfig] = None,
         normalizer: Optional[normalize.Normalizer] = None,
@@ -820,7 +822,8 @@ class ARMOR_Linear(CompressedLinear):
         return self.ARMOR_sparse_(
             naive_compression_config = naive_compression_config,
             block_diagonal_config = block_diagonal_config,
-            optimizer_config = optimizer_config,
+            W_optimizer_config = W_optimizer_config,
+            AB_optimzer_config = AB_optimzer_config,
             training_config = training_config,
             lr_scheduler_config = lr_scheduler_config,
             normalizer = normalizer,
