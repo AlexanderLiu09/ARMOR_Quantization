@@ -811,7 +811,7 @@ class ARMOR_Linear(CompressedLinear):
                naive_compression_config: DictConfig,
         block_diagonal_config: DictConfig,
         W_optimizer_config: DictConfig,
-        AB_optimzer_config: DictConfig,
+        AB_optimizer_config: DictConfig,
         training_config: DictConfig,
         lr_scheduler_config: Optional[DictConfig] = None,
         normalizer: Optional[normalize.Normalizer] = None,
