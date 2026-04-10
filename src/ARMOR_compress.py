@@ -500,9 +500,10 @@ class TrainingConfig:
         print("self.iter_ablation", self.iter_ablation)
 
 
-def initalize_optimizer(
+def initialize_optimizer(
     trainable_sparse: BlockCompressLearnable,
-    optimizer_config: DictConfig):
+    optimizer_config: DictConfig,
+    type: str):
     
     
     # #create the optimizers
@@ -516,11 +517,21 @@ def initalize_optimizer(
     #         continue
     #     if param.requires_grad:
     #         params.append(param)
-            
-    optimizer = instantiate(
-        optimizer_config, 
-        params=trainable_sparse.parameters(),
-    )
+
+
+    if type == "wrapper":
+        optimizer = instantiate(
+            optimizer_config, 
+            params=list(trainable_sparse.A.parameters()) + list(trainable_sparse.B.parameters())
+        )
+    elif type == "core":
+        optimizer = optimizer = instantiate(
+            optimizer_config, 
+            params=trainable_sparse.naive_compression_module.parameters()
+        )
+    else:
+        raise ValueError("Incorrect optimizer type")
+    
     return optimizer
 
 def get_divisors(x):
@@ -597,15 +608,24 @@ class ARMOR_Linear(CompressedLinear):
             **block_diagonal_config,
         )
         #create the optimizers
-        optimizer = initalize_optimizer(
-            trainable_sparse=trainable_sparse,
-            optimizer_config=optimizer_config,
-        )
+        # optimizer = initialize_optimizer(
+        #     trainable_sparse=trainable_sparse,
+        #     optimizer_config=optimizer_config,
+        # )
+
+        W_optimizer = initialize_optimizer(trainable_sparse=trainable_sparse,
+                                          optimizer_config=optimizer_config,
+                                          type = "core")
+        
+        AB_optimizer = initialize_optimizer(trainable_sparse=trainable_sparse,
+                                           optimizer_config=optimizer_config,
+                                           type = "wrapper")
 
         #create the lr scheduler if configured
+        #lr shceduler only for W step
         lr_scheduler = None
         if lr_scheduler_config is not None:
-            lr_scheduler = instantiate(lr_scheduler_config, optimizer=optimizer)
+            lr_scheduler = instantiate(lr_scheduler_config, optimizer=W_optimizer)
 
         start_time = time.time()
         #create a simple logger
@@ -629,12 +649,13 @@ class ARMOR_Linear(CompressedLinear):
                 prev_iter_loss = trainable_sparse.recon_loss(reduction="mean").item()
             
             #NOTE for debug
-            loss_before_continous = trainable_sparse.recon_loss(reduction="mean").item()
-            #optimizer step
-            for j in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
+            loss_before_steps = trainable_sparse.recon_loss(reduction="mean").item()
+
+            #W optimizer step
+            for _ in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
                 
                 #reset the optimizers
-                optimizer.zero_grad()   
+                W_optimizer.zero_grad()   
                 
                 if quant_config is not None and i >= quant_config.qat_start_iter and quant_config.enabled:
                     recon_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=quant_config)
@@ -645,11 +666,20 @@ class ARMOR_Linear(CompressedLinear):
              
                 loss.backward()
                 #step the optimizers
-                optimizer.step()
+                W_optimizer.step()
                 if lr_scheduler is not None:
                     lr_scheduler.step()
 
-            loss_after_continous = trainable_sparse.recon_loss(reduction="mean").item()
+            loss_after_w_step = trainable_sparse.recon_loss(reduction="mean").item()
+
+            for _ in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
+                AB_optimizer.zero_grad()
+
+                loss = trainable_sparse.recon_loss(reduction="mean", quant_config=quant_config)
+                loss.backward()
+                AB_optimizer.step()
+
+            loss_after_AB_step = trainable_sparse.recon_loss(reduction="mean").item()
             
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
@@ -703,14 +733,16 @@ class ARMOR_Linear(CompressedLinear):
             # )
                 
             if i%training_config.log_freq == training_config.log_freq-1 or i==0:
-                current_lr = optimizer.param_groups[0]['lr']
-                log_str = f"Iter: {i}, Loss: {current_loss}, LR: {current_lr:.2e}"
+                W_current_lr = W_optimizer.param_groups[0]['lr']
+                AB_current_lr = AB_optimizer.param_groups[0]['lr']
+                log_str = f"Iter: {i}, Loss: {current_loss}, W LR: {W_current_lr:.2e}, AB LR: {AB_current_lr:.2e}"
                 if self.verbose:
                     print(log_str)
                 if self.use_wandb:
                     log = {self.metric_name: current_loss,
-                           "change/from_cont": loss_after_continous - loss_before_continous,
-                           "loss/from_discrete": current_loss - loss_after_continous,
+                           "change/from_W": loss_after_w_step - loss_before_steps,
+                           "change/from_AB": loss_after_AB_step - loss_after_w_step,
+                           "change/from_sparse": current_loss - loss_after_AB_step,
                            self.step_metric: i+1}
                     if self.direct_wandb_log:
                         wandb.log(log)
