@@ -330,13 +330,17 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         B_selected = B[:, possible_non_zero_idxs, :] #shape of (n_blocks_total, n_possible, n_non_zero, block_size_1)
         B_squared = torch.bmm(B_selected.view(-1, n_nonzero, block_size_1),
                                 B_selected.view(-1,  n_nonzero, block_size_1).transpose(1, 2)) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
-        #add relative damping to the diagonal
+        #add relative damping to the diagonal — keep small in the common case so the closed-form
+        #solution isn't biased; the fallback retry below catches the rare ill-conditioned blocks
         diag_mean = B_squared.diagonal(dim1=-2, dim2=-1).mean(dim=-1).view(-1, 1, 1)
-        B_squared += torch.eye(n_nonzero, device=B.device) * (diag_mean * 1e-4 + 1e-9)
+        B_squared += torch.eye(n_nonzero, device=B.device) * (diag_mean * 1e-7 + 1e-9)
         #get the inverse with cholesky
         L, info = torch.linalg.cholesky_ex(B_squared)
         if (info != 0).any():
             failed = (info != 0)
+            fail_rate = failed.float().mean().item()
+            if fail_rate > 0.001:  # log when >0.1% of blocks need the heavy retry
+                print(f"  cholesky retry fired on {fail_rate*100:.2f}% of blocks")
             B_squared[failed] += torch.eye(n_nonzero, device=B.device) * 1e-3
             L[failed] = torch.linalg.cholesky_ex(B_squared[failed])[0]
         B_squared_inv = torch.cholesky_inverse(L) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
@@ -387,13 +391,7 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         sparse_values = sparse_values / (torch.sum(a**2, dim = 1, keepdim = True) + trainable_sparse.eps) #shape of (n_blocks_total, n_non_zero)
         # DEBUG: warn when sparse values or a norms look anomalous
         a_sq_norms = torch.sum(a**2, dim=1)
-        # if sparse_values.abs().max().item() > 1e6 or a_sq_norms.min().item() < 1e-6:
-        #     print(f"  [sparse_core_step WARNING] sparse_values abs_max={sparse_values.abs().max().item():.6e}")
-        #     print(f"  a squared norms: min={a_sq_norms.min().item():.6e}, max={a_sq_norms.max().item():.6e}")
-        #     print(f"  B_inv_optimal abs_max={B_inv_optimal.abs().max().item():.6e}")
-        #     print(f"  first_order_optimal abs_max={first_order_optimal.abs().max().item():.6e}")
-        #     print(f"  diag_mean range: {diag_mean.min().item():.6e} to {diag_mean.max().item():.6e}")
-        #     print(f"  cholesky failures: {(info != 0).sum().item()}")
+        
         #snap sparse values to the quantization grid if QAT is active
         #NOTE: sparse_values are in normalized space (they get written to X.data),
         #but at inference time, quantization happens in denormalized space
