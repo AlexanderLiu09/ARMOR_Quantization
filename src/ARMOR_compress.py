@@ -665,14 +665,18 @@ class ARMOR_Linear(CompressedLinear):
         for i in tqdm.tqdm(range(training_config.n_iters), disable = not self.verbose):
             #NOTE: for debug
             print_this_iter = False
-            
+
+            #unified objective: once QAT is active, every step (A, B, sparse_core, patience)
+            #optimizes and reports the fake-quantized reconstruction loss
+            active_quant_config = quant_config if (quant_config is not None and quant_config.enabled and i >= quant_config.qat_start_iter) else None
+
             if quant_config is not None and i == quant_config.qat_start_iter:
                 remaining_patience = training_config.overall_patience
-                prev_iter_loss = trainable_sparse.recon_loss(reduction="mean").item()
-            
+                prev_iter_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
+
             #NOTE for debug
-            loss_before_steps = trainable_sparse.recon_loss(reduction="mean").item()
-            trainable_sparse.zero_grad()
+            loss_before_steps = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
+            # trainable_sparse.zero_grad()
             #W optimizer step NOTE: disabled
             # for _ in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
                 
@@ -694,25 +698,39 @@ class ARMOR_Linear(CompressedLinear):
 
             #loss_after_w_step = trainable_sparse.recon_loss(reduction="mean").item()
 
+            #diagnostic captures for the last inner iteration (logged once per outer iter)
+            loss_before_A = loss_before_steps
+            loss_after_A_step = loss_before_steps
+            A_grad_norm = 0.0
+            B_grad_norm = 0.0
+            eta_A = 0.0
+            eta_B = 0.0
+
             for _ in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
-                loss = trainable_sparse.recon_loss(reduction="mean")
+                loss_before_A = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
+
+                trainable_sparse.zero_grad(set_to_none=False)
+                loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
                 loss.backward()
 
+                A_grad_norm = trainable_sparse.A.diag_blocks.grad.norm().item()
                 eta_A = calculate_gd_lr(trainable_sparse, "A")
                 with torch.no_grad():
                     trainable_sparse.A.diag_blocks.data -= eta_A * trainable_sparse.A.diag_blocks.grad
-                    trainable_sparse.A.diag_blocks.grad.zero_()
 
-                loss = trainable_sparse.recon_loss(reduction="mean")
+                loss_after_A_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
+
+                trainable_sparse.zero_grad(set_to_none=False)
+                loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
                 loss.backward()
 
+                B_grad_norm = trainable_sparse.B.diag_blocks.grad.norm().item()
                 eta_B = calculate_gd_lr(trainable_sparse, "B")
                 with torch.no_grad():
                     trainable_sparse.B.diag_blocks.data -= eta_B * trainable_sparse.B.diag_blocks.grad
-                    trainable_sparse.B.diag_blocks.grad.zero_()
 
 
-            loss_after_AB_step = trainable_sparse.recon_loss(reduction="mean").item()
+            loss_after_AB_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
             
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
@@ -722,7 +740,7 @@ class ARMOR_Linear(CompressedLinear):
                         print_this_iter,
                         n_times=training_config.n_sparse_core_updates_per_iter,
                         select=training_config.sparse_core_step_select,
-                        quant_config=quant_config if quant_config is not None and i >= quant_config.qat_start_iter else None,
+                        quant_config=active_quant_config,
                     )
                     # raise ValueError("stop here, we are done with training")
 
@@ -751,7 +769,7 @@ class ARMOR_Linear(CompressedLinear):
 
             #loss stuff
             with torch.no_grad():
-                current_loss = trainable_sparse.recon_loss(reduction="mean").item()
+                current_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
                 if current_loss > (1 - training_config.loss_rtol) * prev_iter_loss or current_loss > prev_iter_loss - training_config.loss_atol:
                     remaining_patience -= 1
 
@@ -768,14 +786,22 @@ class ARMOR_Linear(CompressedLinear):
             if i%training_config.log_freq == training_config.log_freq-1 or i==0:
                 #W_current_lr = W_optimizer.param_groups[0]['lr']
                 # AB_current_lr = AB_optimizer.param_groups[0]['lr']
-                log_str = f"Iter: {i}, Loss: {current_loss}, A LR: {eta_A:.2e}, B LR: {eta_B:.2e}"
+                eta_A_val = eta_A.item() if torch.is_tensor(eta_A) else float(eta_A)
+                eta_B_val = eta_B.item() if torch.is_tensor(eta_B) else float(eta_B)
+                log_str = f"Iter: {i}, Loss: {current_loss}, A LR: {eta_A_val:.2e}, B LR: {eta_B_val:.2e}"
                 if self.verbose:
                     print(log_str)
                 if self.use_wandb:
                     log = {self.metric_name: current_loss,
                            #"change/from_W": loss_after_w_step - loss_before_steps,
+                           "change/from_A": loss_after_A_step - loss_before_A,
+                           "change/from_B": loss_after_AB_step - loss_after_A_step,
                            "change/from_AB": loss_after_AB_step - loss_before_steps,
                            "change/from_sparse": current_loss - loss_after_AB_step,
+                           "eta/A": eta_A_val,
+                           "eta/B": eta_B_val,
+                           "grad_norm/A": A_grad_norm,
+                           "grad_norm/B": B_grad_norm,
                            self.step_metric: i+1}
                     if self.direct_wandb_log:
                         wandb.log(log)
