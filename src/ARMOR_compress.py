@@ -444,28 +444,44 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
 @torch.no_grad()
 def calculate_gd_lr(trainable_sparse: BlockCompressLearnable, wrapper: str):
     """
-    Calculates local beta smoothness for A and B wrappers
-    """  
+    Calculates local beta smoothness for A, B, and W wrappers.
+    W uses the formula from ARMOR paper Appendix D.3 Eq. 12:
+        beta_W = 2 * ||A^T A||_F * ||B · diag(XX^T) · B^T||_F
+    where diag(XX^T) is hessianDiag.
+    """
 
     row_block_size, col_block_size = trainable_sparse.A.block_size, trainable_sparse.B.block_size
     num_row_blocks, num_col_blocks = trainable_sparse.A.num_blocks, trainable_sparse.B.num_blocks
 
-    S = trainable_sparse.naive_compression_module.reconstruct().reshape(num_row_blocks, 
+    S = trainable_sparse.naive_compression_module.reconstruct().reshape(num_row_blocks,
                                                                         row_block_size,
                                                                         num_col_blocks,
                                                                         col_block_size)
-    D = trainable_sparse.naive_compression_module.hessianDiag.reshape(num_col_blocks, 
+    D = trainable_sparse.naive_compression_module.hessianDiag.reshape(num_col_blocks,
                                                                       col_block_size)
     if wrapper == "A":
-        denom = torch.einsum("iajk,jk,ibjk->ijab", S, D, S).norm(dim=(-1, -2)).sum() 
+        denom = torch.einsum("iajk,jk,ibjk->ijab", S, D, S).norm(dim=(-1, -2)).sum()
     elif wrapper == "B":
         S_prime = torch.einsum("iak,ikjb->iajb", trainable_sparse.A.diag_blocks, S)
-        norm_1 = torch.einsum("ikja,ikjb->ijab", S_prime, S).norm(dim=(-1,- 2))   
+        norm_1 = torch.einsum("ikja,ikjb->ijab", S_prime, S).norm(dim=(-1,- 2))
         norm_2 = D.norm(dim=-1)
         denom = torch.sum(norm_1 * norm_2)
+    elif wrapper == "W":
+        A_mat = trainable_sparse.A.diag_blocks  # (num_row_blocks, row_block_size, row_block_size)
+        B_mat = trainable_sparse.B.diag_blocks  # (num_col_blocks, col_block_size, col_block_size)
+        # ||A^T A||_F over block-diagonal A: sqrt of sum over blocks of ||A_i^T A_i||_F^2.
+        # einsum "ika,ikb->iab" computes (A_i^T A_i)[a,b] = sum_k A_i[k,a] * A_i[k,b] per block.
+        ATA = torch.einsum("ika,ikb->iab", A_mat, A_mat)
+        ATA_F = ATA.norm()
+        # ||B · diag(D) · B^T||_F over block-diagonal B: sqrt of sum over blocks.
+        # einsum "jab,jb,jcb->jac" computes (B_j · diag(D_j) · B_j^T)[a,c]
+        # = sum_b B_j[a,b] * D_j[b] * B_j[c,b] per block.
+        BDB = torch.einsum("jab,jb,jcb->jac", B_mat, D, B_mat)
+        BDB_F = BDB.norm()
+        denom = ATA_F * BDB_F
     else:
-        raise ValueError("Cant compute beta smootheness for the specified weight")  
-    
+        raise ValueError("Cant compute beta smootheness for the specified weight")
+
     return 1/(2*denom)
             
         
@@ -699,14 +715,18 @@ class ARMOR_Linear(CompressedLinear):
             #diagnostic captures for the last inner iteration (logged once per outer iter)
             loss_before_A = loss_before_steps
             loss_after_A_step = loss_before_steps
+            loss_after_B_step = loss_before_steps
             A_grad_norm = 0.0
             B_grad_norm = 0.0
+            W_grad_norm = 0.0
             eta_A = 0.0
             eta_B = 0.0
+            eta_W = 0.0
 
             for _ in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
                 loss_before_A = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
 
+                # A step
                 trainable_sparse.zero_grad(set_to_none=False)
                 loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
                 loss.backward()
@@ -718,6 +738,7 @@ class ARMOR_Linear(CompressedLinear):
 
                 loss_after_A_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
 
+                # B step
                 trainable_sparse.zero_grad(set_to_none=False)
                 loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
                 loss.backward()
@@ -727,8 +748,23 @@ class ARMOR_Linear(CompressedLinear):
                 with torch.no_grad():
                     trainable_sparse.B.diag_blocks.data -= eta_B * trainable_sparse.B.diag_blocks.grad
 
+                loss_after_B_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
 
-            loss_after_AB_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
+                # W step — beta-smoothness GD on the sparse core values.
+                # reconstruct_() applies X * sparse_mask, so autodiff zeroes grads at masked
+                # positions and the update preserves the sparsity pattern.
+                trainable_sparse.zero_grad(set_to_none=False)
+                loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
+                loss.backward()
+
+                X_param = trainable_sparse.naive_compression_module.X
+                W_grad_norm = X_param.grad.norm().item()
+                eta_W = calculate_gd_lr(trainable_sparse, "W")
+                with torch.no_grad():
+                    X_param.data -= eta_W * X_param.grad
+
+
+            loss_after_ABW_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
             
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
@@ -786,20 +822,23 @@ class ARMOR_Linear(CompressedLinear):
                 # AB_current_lr = AB_optimizer.param_groups[0]['lr']
                 eta_A_val = eta_A.item() if torch.is_tensor(eta_A) else float(eta_A)
                 eta_B_val = eta_B.item() if torch.is_tensor(eta_B) else float(eta_B)
-                log_str = f"Iter: {i}, Loss: {current_loss}, A LR: {eta_A_val:.2e}, B LR: {eta_B_val:.2e}"
+                eta_W_val = eta_W.item() if torch.is_tensor(eta_W) else float(eta_W)
+                log_str = f"Iter: {i}, Loss: {current_loss}, A LR: {eta_A_val:.2e}, B LR: {eta_B_val:.2e}, W LR: {eta_W_val:.2e}"
                 if self.verbose:
                     print(log_str)
                 if self.use_wandb:
                     log = {self.metric_name: current_loss,
-                           #"change/from_W": loss_after_w_step - loss_before_steps,
                            "change/from_A": loss_after_A_step - loss_before_A,
-                           "change/from_B": loss_after_AB_step - loss_after_A_step,
-                           "change/from_AB": loss_after_AB_step - loss_before_steps,
-                           "change/from_sparse": current_loss - loss_after_AB_step,
+                           "change/from_B": loss_after_B_step - loss_after_A_step,
+                           "change/from_W": loss_after_ABW_step - loss_after_B_step,
+                           "change/from_ABW": loss_after_ABW_step - loss_before_steps,
+                           "change/from_sparse": current_loss - loss_after_ABW_step,
                            "eta/A": eta_A_val,
                            "eta/B": eta_B_val,
+                           "eta/W": eta_W_val,
                            "grad_norm/A": A_grad_norm,
                            "grad_norm/B": B_grad_norm,
+                           "grad_norm/W": W_grad_norm,
                            self.step_metric: i+1}
                     if self.direct_wandb_log:
                         wandb.log(log)
