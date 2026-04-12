@@ -268,6 +268,12 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         row_scales = find_optimal_scale_per_row(S_nonzero_rows, quant_config.n_bits,
                                                  quant_config.n_grid, hessian_weights)
 
+        # precompute all possible integer value pairs (constant across iterations)
+        q_max = 2 ** (quant_config.n_bits - 1) - 1
+        q_vals = torch.arange(-q_max, q_max + 1, device=S_denorm.device, dtype=S_denorm.dtype)
+        q_pairs = torch.cartesian_prod(q_vals, q_vals)  # [n_q_pairs, n_nonzero]
+        n_q_pairs = q_pairs.shape[0]
+
     for i in range(n_times):
         
         # selection code
@@ -355,114 +361,109 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         B_selected = B[:, possible_non_zero_idxs, :] #shape of (n_blocks_total, n_possible, n_non_zero, block_size_1)
         B_squared = torch.bmm(B_selected.view(-1, n_nonzero, block_size_1),
                                 B_selected.view(-1,  n_nonzero, block_size_1).transpose(1, 2)) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
-        #add relative damping to the diagonal — keep small in the common case so the closed-form
-        #solution isn't biased; the fallback retry below catches the rare ill-conditioned blocks
-        diag_mean = B_squared.diagonal(dim1=-2, dim2=-1).mean(dim=-1).view(-1, 1, 1)
-        B_squared += torch.eye(n_nonzero, device=B.device) * (diag_mean * 1e-7 + 1e-9)
-        #get the inverse with cholesky
-        L, info = torch.linalg.cholesky_ex(B_squared)
-        if (info != 0).any():
-            failed = (info != 0)
-            fail_rate = failed.float().mean().item()
-            if fail_rate > 0.001:  # log when >0.1% of blocks need the heavy retry
-                print(f"  cholesky retry fired on {fail_rate*100:.2f}% of blocks")
-            B_squared[failed] += torch.eye(n_nonzero, device=B.device) * 1e-3
-            L[failed] = torch.linalg.cholesky_ex(B_squared[failed])[0]
-        B_squared_inv = torch.cholesky_inverse(L) #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
 
+        # g for all patterns: first_order_term indexed by each pattern's nonzero positions
+        # includes the 2.0 factor from line above
+        g_all = first_order_term[:, possible_non_zero_idxs] #shape of (n_blocks_total, n_possible, n_nonzero)
 
-        #shape of (n_blocks_total*n_possible, n_non_zero, n_non_zero)
-        first_order_selected = 1/2 * first_order_term[:, possible_non_zero_idxs] #shape of (n_blocks_total, n_possible, n_non_zero)
-        first_order_selected = first_order_selected.view(n_blocks_total * n_possible, n_nonzero, 1) #shape of (n_blocks_total*n_possible, n_non_zero, 1)
-        #calculate the cost
-        cost = -torch.bmm(first_order_selected.transpose(1, 2),
-                            torch.bmm(B_squared_inv, first_order_selected)).squeeze(2).squeeze(1) #shape of (n_blocks_total*n_possible, )
-        
-        #the actual cost is the current cost divided by the squared l2 norm of a and with W_remaining's F norm squared add
-        #we are ignoring the constant term since it does not affect the optimization
-        #reshape 
-        cost = cost.view(n_blocks_total, n_possible)
-        
-        #get the optimal mask
-        optimal_mask = torch.argmin(cost, dim=1) #shape of (n_blocks_total, )
-
-        #get the optimal non-zero indices
-        optimal_non_zero_idxs = possible_non_zero_idxs[optimal_mask] #shape of (n_blocks_total, n_nonzero)
-        
-        #update the naive sparse
-        
-        #update the mask
-        #first we zero out the groups selected in the mask 
-        trainable_sparse.naive_compression_module.sparse_mask[group_idxs[:,0].unsqueeze(1),
-                                                        group_idxs[:,1].unsqueeze(1) + torch.arange(group_size, device = group_idxs.device).unsqueeze(0)] = False
-
-        #now we set the non-zero indices in the mask to True
-        trainable_sparse.naive_compression_module.sparse_mask[group_idxs[:,0].unsqueeze(1),
-                                                        optimal_non_zero_idxs + group_idxs[:,1].unsqueeze(1)] = True #shape of (n_blocks_total, n_nonzero)
-        
-        
-        #check the mask 
-        # assert torch.all(trainable_sparse.naive_compression_module.sparse_mask == o_mask), "Mask has changed, this should not happen."
-        trainable_sparse.naive_compression_module.check_mask()
-        
-        #update the underlying/transformed matrix, called X in NoWag
-        #first we calculate the sparse values 
-        B_inv_optimal = B_squared_inv.view(n_blocks_total, n_possible, n_nonzero, n_nonzero)[torch.arange(n_blocks_total, device=B.device), optimal_mask] #shape of (n_blocks_total, n_non_zero, n_non_zero)
-        first_order_optimal = first_order_selected.view(n_blocks_total, n_possible, n_nonzero)[
-            torch.arange(n_blocks_total, device=B.device), optimal_mask].unsqueeze(2) #shape of (n_blocks_total, n_non_zero, 1)
-        #calculate the sparse values
-        sparse_values = -torch.bmm(B_inv_optimal, first_order_optimal).squeeze(2) #shape of (n_blocks_total, n_non_zero)
-        #now scale by square of a's norm
-        sparse_values = sparse_values / (torch.sum(a**2, dim = 1, keepdim = True) + trainable_sparse.eps) #shape of (n_blocks_total, n_non_zero)
-        # DEBUG: warn when sparse values or a norms look anomalous
-        a_sq_norms = torch.sum(a**2, dim=1)
-        
-        #snap sparse values to the quantization grid using precomputed per-row scales
-        #NOTE: sparse_values are in normalized space (they get written to X.data),
-        #but at inference time, quantization happens in denormalized space
-        #(BlockCompressLearnable.forward quantizes after reconstruct() which denormalizes).
-        #So we must denormalize -> quantize -> renormalize to match inference behavior.
         if quant_config is not None and quant_config.enabled:
-            naive_normalizer = trainable_sparse.naive_compression_module.normalizer
-            rows = group_idxs[:, 0]  # (n_blocks_total,)
-            cols = optimal_non_zero_idxs + group_idxs[:, 1].unsqueeze(1)  # (n_blocks_total, n_nonzero)
+            #=== Quantization-aware path: exhaustive enumeration over (pattern, q1, q2) ===
 
-            # compute per-element denormalization factor (multiplicative only)
-            denorm_factor = torch.ones_like(sparse_values)
+            H = B_squared.view(n_blocks_total, n_possible, n_nonzero, n_nonzero)
+            a_sq = (a ** 2).sum(dim=1) #shape of (n_blocks_total,)
+
+            # compute denorm factors for ALL patterns (not just the winner)
+            rows = group_idxs[:, 0]  # (n_blocks_total,)
+            all_cols = possible_non_zero_idxs[None, :, :] + group_idxs[:, 1].unsqueeze(1).unsqueeze(2)
+            # all_cols shape: [n_blocks_total, n_possible, n_nonzero]
+
+            naive_normalizer = trainable_sparse.naive_compression_module.normalizer
+            denorm_factor_all = torch.ones(n_blocks_total, n_possible, n_nonzero, device=a.device, dtype=a.dtype)
             for j_norm in reversed(range(len(naive_normalizer.norm_order))):
                 dim = naive_normalizer.norm_order[j_norm]
                 norm = naive_normalizer.norms[j_norm]
                 if norm is not None and norm.numel() > 0:
                     if dim == 0:  # column norm, indexed by col
-                        denorm_factor = denorm_factor * norm[cols]
+                        denorm_factor_all = denorm_factor_all * norm[all_cols]
                     elif dim == 1:  # row norm, indexed by row
-                        denorm_factor = denorm_factor * norm[rows].unsqueeze(1)
+                        denorm_factor_all = denorm_factor_all * norm[rows][:, None, None]
 
-            sparse_values_denorm = sparse_values * denorm_factor
-
-            # snap to quantization grid using the precomputed per-row scales
-            q_max = 2 ** (quant_config.n_bits - 1) - 1
+            # convert integer pairs to normalized-space candidates
+            # s_norm = q_int * row_scale / denorm_factor
             scales_for_blocks = row_scales[rows]  # (n_blocks_total,)
-            sparse_values_denorm = (
-                torch.clamp(torch.round(sparse_values_denorm / scales_for_blocks[:, None]),
-                            -q_max, q_max)
-                * scales_for_blocks[:, None]
-            )
+            s_candidates = (
+                q_pairs[None, None, :, :]                      # [1, 1, n_q_pairs, n_nonzero]
+                * scales_for_blocks[:, None, None, None]        # [n_blocks, 1, 1, 1]
+                / denorm_factor_all[:, :, None, :]              # [n_blocks, n_possible, 1, n_nonzero]
+            )  # [n_blocks_total, n_possible, n_q_pairs, n_nonzero]
 
-            sparse_values = sparse_values_denorm / denorm_factor
-        #update the sparse values
+            # evaluate quadratic cost: a_sq * s^T H s + g^T s
+            Hs = torch.einsum('bpij,bpqj->bpqi', H, s_candidates)
+            sHs = (s_candidates * Hs).sum(dim=-1)               # [n_blocks, n_possible, n_q_pairs]
+            gs = (g_all[:, :, None, :] * s_candidates).sum(dim=-1)  # [n_blocks, n_possible, n_q_pairs]
+            cost = a_sq[:, None, None] * sHs + gs               # [n_blocks, n_possible, n_q_pairs]
+
+            # find best (pattern, q_pair) per block
+            cost_flat = cost.reshape(n_blocks_total, n_possible * n_q_pairs)
+            best_flat_idx = cost_flat.argmin(dim=1)              # [n_blocks_total]
+
+            optimal_mask = best_flat_idx // n_q_pairs            # which pattern
+            best_q_idx = best_flat_idx % n_q_pairs               # which q_pair
+
+            optimal_non_zero_idxs = possible_non_zero_idxs[optimal_mask]  # [n_blocks, n_nonzero]
+            optimal_q_pair = q_pairs[best_q_idx]                          # [n_blocks, n_nonzero]
+
+            # convert winning q_pair to normalized space for writing to X.data
+            winning_denorm = denorm_factor_all[torch.arange(n_blocks_total, device=a.device), optimal_mask]
+            sparse_values = optimal_q_pair * scales_for_blocks[:, None] / winning_denorm
+
+        else:
+            #=== Non-quantized path: closed-form continuous solve ===
+
+            # add damping for numerical stability before inversion
+            diag_mean = B_squared.diagonal(dim1=-2, dim2=-1).mean(dim=-1).view(-1, 1, 1)
+            B_squared += torch.eye(n_nonzero, device=B.device) * (diag_mean * 1e-7 + 1e-9)
+            L, info = torch.linalg.cholesky_ex(B_squared)
+            if (info != 0).any():
+                failed = (info != 0)
+                fail_rate = failed.float().mean().item()
+                if fail_rate > 0.001:
+                    print(f"  cholesky retry fired on {fail_rate*100:.2f}% of blocks")
+                B_squared[failed] += torch.eye(n_nonzero, device=B.device) * 1e-3
+                L[failed] = torch.linalg.cholesky_ex(B_squared[failed])[0]
+            B_squared_inv = torch.cholesky_inverse(L)
+
+            # cost at continuous optimum for pattern selection
+            g_half = (0.5 * g_all).view(n_blocks_total * n_possible, n_nonzero, 1)
+            cost = -torch.bmm(g_half.transpose(1, 2),
+                                torch.bmm(B_squared_inv, g_half)).squeeze(2).squeeze(1)
+            cost = cost.view(n_blocks_total, n_possible)
+            optimal_mask = torch.argmin(cost, dim=1)
+            optimal_non_zero_idxs = possible_non_zero_idxs[optimal_mask]
+
+            # extract optimal values via closed-form solve
+            B_inv_optimal = B_squared_inv.view(n_blocks_total, n_possible, n_nonzero, n_nonzero)[
+                torch.arange(n_blocks_total, device=B.device), optimal_mask]
+            g_half_optimal = g_half.view(n_blocks_total, n_possible, n_nonzero)[
+                torch.arange(n_blocks_total, device=B.device), optimal_mask].unsqueeze(2)
+            sparse_values = -torch.bmm(B_inv_optimal, g_half_optimal).squeeze(2)
+            sparse_values = sparse_values / (torch.sum(a**2, dim=1, keepdim=True) + trainable_sparse.eps)
+
+        # update the mask
+        trainable_sparse.naive_compression_module.sparse_mask[group_idxs[:,0].unsqueeze(1),
+                                                        group_idxs[:,1].unsqueeze(1) + torch.arange(group_size, device = group_idxs.device).unsqueeze(0)] = False
+        trainable_sparse.naive_compression_module.sparse_mask[group_idxs[:,0].unsqueeze(1),
+                                                        optimal_non_zero_idxs + group_idxs[:,1].unsqueeze(1)] = True
+        trainable_sparse.naive_compression_module.check_mask()
+
+        # write the sparse values
         trainable_sparse.naive_compression_module.X.data[group_idxs[:,0].unsqueeze(1),
-                                                        optimal_non_zero_idxs + group_idxs[:,1].unsqueeze(1)] = sparse_values #shape of (n_blocks_total, n_non_zero)
-        
+                                                        optimal_non_zero_idxs + group_idxs[:,1].unsqueeze(1)] = sparse_values
+
         if print_this_iter:
-            final_loss = trainable_sparse.recon_loss().item() 
-            #print (f"----------------------------LOSS AFTER SPARSE CORE STEP {i}: {final_loss}------------------------")   
+            final_loss = trainable_sparse.recon_loss().item()
             print(f"Sparse step decreased loss: {final_loss < init_loss}")
             init_loss = final_loss
-            # if final_loss > 1.01*init_loss:
-            #     raise ValueError("Sparse core step increased loss by over 1%")
-            # else:
-            #     init_loss = final_loss
         
         
                 
