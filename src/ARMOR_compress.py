@@ -237,8 +237,7 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         k = idxs % n_blocks_1 #this is the block index in the 1st dimension
 
         if selection_config.random:
-            idx_0 = j*block_size_0 + torch.randint(0, block_size_0, (n_blocks_total,), device=trainable_sparse.original_weight.device) #shape of (n_blocks_total,)
-            idx_1 = k * block_size_1 + torch.randint(0, n_groups_per_block_row, (n_blocks_total,), device=trainable_sparse.original_weight.device) * d
+            raise NotImplementedError("Random selection not implemented yet")
             
             
         else:
