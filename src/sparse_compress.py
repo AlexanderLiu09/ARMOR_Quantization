@@ -10,7 +10,7 @@ import wandb
 from typing import Tuple, Optional, Union, List, Literal
 import src.utils.normalizer as normalize
 import src.compression_parent as compression_parent
-from src.utils.quantize import quantize_per_group, dequantize_per_group
+from src.utils.quantize import quantize_per_row, dequantize_per_row, find_optimal_scale_per_row
 
 class SparseCheckError(Exception):
     """Custom exception for sparse check errors."""
@@ -251,16 +251,11 @@ class SparseLinear(compression_parent.CompressedLinear):
         return reconstructed
     
     def reconstruct_quantized_(self, denormalize: bool = True) -> torch.FloatTensor:
-        """same as reconstruct_() but dequantizes first"""
-        assert len(self.X_int.shape) == 1, "Expect X_int to be 1D"
+        """same as reconstruct_() but dequantizes first using per-row scales"""
+        X_float = dequantize_per_row(self.X_int, self.scale)  # [d_out, nnz_per_row]
 
-        X_float = dequantize_per_group(self.X_int,
-                                       self.scale,
-                                       self.zero_point if self.zero_point.numel() > 0 else None,
-                                       self.quant_group_size)
-        
-        reconstructed = torch.zeros((self.out_features, self.in_features), device = X_float.device, dtype = X_float.dtype)
-        reconstructed[self.sparse_mask] = X_float
+        reconstructed = torch.zeros((self.out_features, self.in_features), device=X_float.device, dtype=X_float.dtype)
+        reconstructed[self.sparse_mask] = X_float.reshape(-1)
 
         if denormalize:
             reconstructed = self.normalizer.denormalize(reconstructed)
@@ -308,23 +303,35 @@ class SparseLinear(compression_parent.CompressedLinear):
     #         self.quant_symmetric = True
 
     @torch.no_grad()
-    def quantize_sparse_values(self, n_bits, group_size, symmetric):
-        """Quantizes non-zero sparse values
+    def quantize_sparse_values(self, n_bits, n_grid=100, importance_weight=None):
+        """Quantizes non-zero sparse values using per-row grid-searched scales.
+
+        Args:
+            n_bits: Bit width for quantization.
+            n_grid: Grid search resolution for optimal scale.
+            importance_weight: Optional [d_in] Hessian diagonal for activation-aware scales.
         """
         assert len(self.X.shape) == 1, "X should be 1D"
-        X_int, scale, zero_point = quantize_per_group(self.X.data,
-                                                      n_bits, 
-                                                      group_size,
-                                                      symmetric)
+        nnz_per_row = self.sparse_mask.sum(dim=1)[0].item()
+        X_rows = self.X.data.reshape(self.out_features, nnz_per_row)
+
+        # get Hessian weights at nonzero positions
+        hessian_weights = None
+        if importance_weight is not None:
+            col_indices = self.sparse_mask.nonzero(as_tuple=False)[:, 1].reshape(
+                self.out_features, nnz_per_row)
+            hessian_weights = importance_weight[col_indices]
+
+        scale = find_optimal_scale_per_row(X_rows, n_bits, n_grid, hessian_weights)
+        X_int, scale = quantize_per_row(X_rows, n_bits, scale)
+
         del self.X
 
-        self.register_buffer("X_int", X_int)
-        self.register_buffer("scale", scale)
-        self.register_buffer("zero_point", zero_point if zero_point is not None else torch.tensor([], device = scale.device))
+        self.register_buffer("X_int", X_int)        # [d_out, nnz_per_row]
+        self.register_buffer("scale", scale)         # [d_out]
 
         self.quant_n_bits = n_bits
-        self.quant_group_size = group_size
-        self.quant_symmetric = symmetric
+        self.quant_n_grid = n_grid
         self.quantized = True
 
 
@@ -383,32 +390,29 @@ class QuantizedSparseLinear(SparseLinear):
         sparse_group: Optional[int] = None,
         normalizer_kwargs: Optional[dict] = None,
         normalizer: Optional[normalize.Normalizer] = None,
-        quant_n_bits: int = 8,
-        quant_group_size: int = 128,
-        quant_symmetric: bool = True,
+        quant_n_bits: int = 4,
+        quant_n_grid: int = 100,
         **kwargs):
-        """Same as super().blank_recreate but instatiate quantized buffers instead
+        """Same as super().blank_recreate but instantiate quantized buffers instead.
+
+        Buffers use per-row layout: X_int is [d_out, nnz_per_row], scale is [d_out].
         """
 
-        super().blank_recreate(frac_nonzero, pattern, sparse_group, 
+        super().blank_recreate(frac_nonzero, pattern, sparse_group,
                                normalizer_kwargs, normalizer, **kwargs)
         del self.X
 
-        n_nonzero_total = self.n_non_zero_per_group * self.get_n_original_parameters()// self.sparse_group
-        n_quant_goups = math.ceil(n_nonzero_total / quant_group_size)
+        nnz_per_row = self.n_non_zero_per_group * self.in_features // self.sparse_group
 
-        self.register_buffer("X_int", torch.zeros(n_nonzero_total,
-                                                  dtype = torch.int8, #TODO int4
-                                                  device = self.original_weight.device))
-        self.register_buffer("scale", torch.ones(n_quant_goups,
-                                                  dtype = self.original_weight.dtype,
-                                                  device = self.original_weight.device))
-        self.register_buffer("zero_point", torch.tensor([], 
-                                                        device = self.original_weight.device))
-        
+        self.register_buffer("X_int", torch.zeros(self.out_features, nnz_per_row,
+                                                  dtype=torch.int8,
+                                                  device=self.original_weight.device))
+        self.register_buffer("scale", torch.ones(self.out_features,
+                                                  dtype=self.original_weight.dtype,
+                                                  device=self.original_weight.device))
+
         self.quant_n_bits = quant_n_bits
-        self.quant_group_size = quant_group_size
-        self.quant_symmetric = quant_symmetric
+        self.quant_n_grid = quant_n_grid
 
 
 

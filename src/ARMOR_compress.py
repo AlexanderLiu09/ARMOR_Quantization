@@ -27,7 +27,7 @@ from src.sparse_compress import SparseLinear
 from src.utils import normalizer as normalize
 from src.utils import utils
 from src.utils.blockwise_diag_matricies import BlockwiseDiagMatrix
-from src.utils.quantize import fake_quantize, QuantConfig
+from src.utils.quantize import fake_quantize_per_row, find_optimal_scale_per_row, QuantConfig
     
 class BlockCompressLearnable(nn.Module):
     original_weight: torch.FloatTensor
@@ -107,15 +107,22 @@ class BlockCompressLearnable(nn.Module):
                 quant_config: Optional[QuantConfig] = None):
         S = self.naive_compression_module.reconstruct()
 
-        #fake quantize all non zero values in S, write to clone
+        #fake quantize all non zero values in S using per-row grid-searched scales
         if quant_config is not None and quant_config.enabled:
             sparse_mask = self.naive_compression_module.sparse_mask
             S = S.clone()
-            S_non_zero_quantized = fake_quantize(S[sparse_mask], 
-                                                 quant_config.n_bits,
-                                                 quant_config.group_size,
-                                                 quant_config.symmetric)
-            S[sparse_mask] = S_non_zero_quantized
+            nnz_per_row = sparse_mask.sum(dim=1)[0].item()
+            S_nonzero_rows = S[sparse_mask].reshape(self.d_out, nnz_per_row)
+
+            # get Hessian weights at nonzero positions for activation-aware scale search
+            hessian_weights = None
+            if self.importance_weight is not None:
+                col_indices = sparse_mask.nonzero(as_tuple=False)[:, 1].reshape(self.d_out, nnz_per_row)
+                hessian_weights = self.importance_weight[col_indices]
+
+            S_quantized = fake_quantize_per_row(S_nonzero_rows, quant_config.n_bits,
+                                                 quant_config.n_grid, hessian_weights)
+            S[sparse_mask] = S_quantized.reshape(-1)
 
         return self.A @ S @ self.B            
         
@@ -242,6 +249,24 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         
    
     selection_config = SelectionConfig.from_name(select)
+
+    # precompute per-row quantization scales from the current full denormalized S
+    row_scales = None
+    if quant_config is not None and quant_config.enabled:
+        d_out = trainable_sparse.original_weight.shape[0]
+        d_in = trainable_sparse.original_weight.shape[1]
+        S_denorm = trainable_sparse.naive_compression_module.reconstruct()  # [d_out, d_in]
+        sparse_mask = trainable_sparse.naive_compression_module.sparse_mask
+        nnz_per_row = sparse_mask.sum(dim=1)[0].item()
+        S_nonzero_rows = S_denorm[sparse_mask].reshape(d_out, nnz_per_row)
+
+        hessian_weights = None
+        if trainable_sparse.importance_weight is not None:
+            col_indices = sparse_mask.nonzero(as_tuple=False)[:, 1].reshape(d_out, nnz_per_row)
+            hessian_weights = trainable_sparse.importance_weight[col_indices]
+
+        row_scales = find_optimal_scale_per_row(S_nonzero_rows, quant_config.n_bits,
+                                                 quant_config.n_grid, hessian_weights)
 
     for i in range(n_times):
         
@@ -392,7 +417,7 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         # DEBUG: warn when sparse values or a norms look anomalous
         a_sq_norms = torch.sum(a**2, dim=1)
         
-        #snap sparse values to the quantization grid if QAT is active
+        #snap sparse values to the quantization grid using precomputed per-row scales
         #NOTE: sparse_values are in normalized space (they get written to X.data),
         #but at inference time, quantization happens in denormalized space
         #(BlockCompressLearnable.forward quantizes after reconstruct() which denormalizes).
@@ -414,16 +439,16 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
                         denorm_factor = denorm_factor * norm[rows].unsqueeze(1)
 
             sparse_values_denorm = sparse_values * denorm_factor
-            # Use n_nonzero as group_size so each block's values form their own
-            # quantization group. With group_size=128 (default), values from blocks
-            # with very different denorm factors would share a group -- the scale
-            # is set by the largest value, zeroing out smaller ones, and dividing
-            # by a small denorm_factor then amplifies the error catastrophically.
-            # n_nonzero (e.g. 2 for 2:4 sparsity) keeps same-row, same-block
-            # values together where denorm factors are similar.
-            sparse_values_denorm = fake_quantize(sparse_values_denorm, quant_config.n_bits,
-                                                  group_size=n_nonzero,
-                                                  symmetric=quant_config.symmetric)
+
+            # snap to quantization grid using the precomputed per-row scales
+            q_max = 2 ** (quant_config.n_bits - 1) - 1
+            scales_for_blocks = row_scales[rows]  # (n_blocks_total,)
+            sparse_values_denorm = (
+                torch.clamp(torch.round(sparse_values_denorm / scales_for_blocks[:, None]),
+                            -q_max, q_max)
+                * scales_for_blocks[:, None]
+            )
+
             sparse_values = sparse_values_denorm / denorm_factor
         #update the sparse values
         trainable_sparse.naive_compression_module.X.data[group_idxs[:,0].unsqueeze(1),
@@ -515,7 +540,8 @@ class TrainingConfig:
 
     """
     n_iters: int = 100
-    n_continous_updates_per_iter: int = 1
+    n_W_updates_per_iter: int = 1
+    n_AB_updates_per_iter: int = 1
     n_sparse_core_updates_per_iter: int = 0
     sparse_core_step_select: str = "random"
     overall_patience: int = 10
@@ -525,11 +551,10 @@ class TrainingConfig:
     log_freq: int = 1
     iter_save_path: Optional[str] = None
     iter_save_freq: int = -1
-    #new
+    #quantization
     quant_enabled: bool = False
-    quant_n_bits: int = 8
-    quant_group_size: int = 128
-    quant_symmetric: bool = True
+    quant_n_bits: int = 4
+    quant_n_grid: int = 100
     quant_qat_start_iter: int = 0
 
     
@@ -610,8 +635,7 @@ class ARMOR_Linear(CompressedLinear):
         
         quant_config = QuantConfig(training_config.quant_enabled,
                                    training_config.quant_n_bits,
-                                   training_config.quant_group_size,
-                                   training_config.quant_symmetric,
+                                   training_config.quant_n_grid,
                                    training_config.quant_qat_start_iter)
 
         normalized_weight = self.initialize_normalizer(
@@ -648,20 +672,19 @@ class ARMOR_Linear(CompressedLinear):
         )
         
 
-        #NOTE: no optimizers needed for this implementation
-        # W_optimizer = initialize_optimizer(trainable_sparse=trainable_sparse,
-        #                                   optimizer_config=W_optimizer_config,
-        #                                   type = "core")
+        W_optimizer = initialize_optimizer(trainable_sparse=trainable_sparse,
+                                          optimizer_config=W_optimizer_config,
+                                          type = "core")
         
-        # AB_optimizer = initialize_optimizer(trainable_sparse=trainable_sparse,
-        #                                    optimizer_config=AB_optimizer_config,
-        #                                    type = "wrapper")
+        AB_optimizer = initialize_optimizer(trainable_sparse=trainable_sparse,
+                                           optimizer_config=AB_optimizer_config,
+                                           type = "wrapper")
 
         #create the lr scheduler if configured
         #lr shceduler only for W step
-        # lr_scheduler = None
-        # if lr_scheduler_config is not None:
-        #     lr_scheduler = instantiate(lr_scheduler_config, optimizer=W_optimizer)
+        lr_scheduler = None
+        if lr_scheduler_config is not None:
+            lr_scheduler = instantiate(lr_scheduler_config, optimizer=W_optimizer)
 
         start_time = time.time()
         #create a simple logger
@@ -691,80 +714,32 @@ class ARMOR_Linear(CompressedLinear):
             #NOTE for debug
             loss_before_steps = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
             # trainable_sparse.zero_grad()
-            #W optimizer step NOTE: disabled
-            # for _ in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
+            #W optimizer step 
+            for _ in tqdm.tqdm(range(training_config.n_W_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
                 
-            #     #reset the optimizers
-            #     W_optimizer.zero_grad()   
-                
-            #     if quant_config is not None and i >= quant_config.qat_start_iter and quant_config.enabled:
-            #         recon_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=quant_config)
-            #     else:
-            #         recon_loss = trainable_sparse.recon_loss(reduction="mean")
+                #reset the optimizers
+                W_optimizer.zero_grad()   
 
-            #     loss = recon_loss
-             
-            #     loss.backward()
-            #     #step the optimizers
-            #     W_optimizer.step()
-            #     if lr_scheduler is not None:
-            #         lr_scheduler.step()
-
-            #loss_after_w_step = trainable_sparse.recon_loss(reduction="mean").item()
-
-            #diagnostic captures for the last inner iteration (logged once per outer iter)
-            loss_before_A = loss_before_steps
-            loss_after_A_step = loss_before_steps
-            loss_after_B_step = loss_before_steps
-            A_grad_norm = 0.0
-            B_grad_norm = 0.0
-            W_grad_norm = 0.0
-            eta_A = 0.0
-            eta_B = 0.0
-            eta_W = 0.0
-
-            for _ in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
-                loss_before_A = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
-
-                # A step
-                trainable_sparse.zero_grad(set_to_none=False)
                 loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
                 loss.backward()
 
-                A_grad_norm = trainable_sparse.A.diag_blocks.grad.norm().item()
-                eta_A = calculate_gd_lr(trainable_sparse, "A")
-                with torch.no_grad():
-                    trainable_sparse.A.diag_blocks.data -= eta_A * trainable_sparse.A.diag_blocks.grad
+                #step the optimizers
+                W_optimizer.step()
+                if lr_scheduler is not None:
+                    lr_scheduler.step()
+            
+            loss_after_W_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
 
-                loss_after_A_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
+            for _ in tqdm.tqdm(range(training_config.n_AB_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)): 
+                AB_optimizer.zero_grad()
 
-                # B step
-                trainable_sparse.zero_grad(set_to_none=False)
                 loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
                 loss.backward()
 
-                B_grad_norm = trainable_sparse.B.diag_blocks.grad.norm().item()
-                eta_B = calculate_gd_lr(trainable_sparse, "B")
-                with torch.no_grad():
-                    trainable_sparse.B.diag_blocks.data -= eta_B * trainable_sparse.B.diag_blocks.grad
-
-                loss_after_B_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
-
-                # W step — beta-smoothness GD on the sparse core values.
-                # reconstruct_() applies X * sparse_mask, so autodiff zeroes grads at masked
-                # positions and the update preserves the sparsity pattern.
-                trainable_sparse.zero_grad(set_to_none=False)
-                loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
-                loss.backward()
-
-                X_param = trainable_sparse.naive_compression_module.X
-                W_grad_norm = X_param.grad.norm().item()
-                eta_W = calculate_gd_lr(trainable_sparse, "W")
-                with torch.no_grad():
-                    X_param.data -= eta_W * X_param.grad
+                AB_optimizer.step()
 
 
-            loss_after_ABW_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
+            loss_after_AB_step = trainable_sparse.recon_loss(reduction="mean").item()
             
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
@@ -818,27 +793,16 @@ class ARMOR_Linear(CompressedLinear):
             # )
                 
             if i%training_config.log_freq == training_config.log_freq-1 or i==0:
-                #W_current_lr = W_optimizer.param_groups[0]['lr']
-                # AB_current_lr = AB_optimizer.param_groups[0]['lr']
-                eta_A_val = eta_A.item() if torch.is_tensor(eta_A) else float(eta_A)
-                eta_B_val = eta_B.item() if torch.is_tensor(eta_B) else float(eta_B)
-                eta_W_val = eta_W.item() if torch.is_tensor(eta_W) else float(eta_W)
-                log_str = f"Iter: {i}, Loss: {current_loss}, A LR: {eta_A_val:.2e}, B LR: {eta_B_val:.2e}, W LR: {eta_W_val:.2e}"
+                W_current_lr = W_optimizer.param_groups[0]['lr']
+                AB_current_lr = AB_optimizer.param_groups[0]['lr']
+                log_str = f"Iter: {i}, Loss: {current_loss}, AB LR:{AB_current_lr}, W LR: {W_current_lr:.2e}"
                 if self.verbose:
                     print(log_str)
                 if self.use_wandb:
                     log = {self.metric_name: current_loss,
-                           "change/from_A": loss_after_A_step - loss_before_A,
-                           "change/from_B": loss_after_B_step - loss_after_A_step,
-                           "change/from_W": loss_after_ABW_step - loss_after_B_step,
-                           "change/from_ABW": loss_after_ABW_step - loss_before_steps,
-                           "change/from_sparse": current_loss - loss_after_ABW_step,
-                           "eta/A": eta_A_val,
-                           "eta/B": eta_B_val,
-                           "eta/W": eta_W_val,
-                           "grad_norm/A": A_grad_norm,
-                           "grad_norm/B": B_grad_norm,
-                           "grad_norm/W": W_grad_norm,
+                           "change/from_W": loss_after_W_step - loss_before_steps,
+                           "change/from_ABW": loss_after_AB_step - loss_after_W_step,
+                           "change/from_sparse": current_loss - loss_after_AB_step,
                            self.step_metric: i+1}
                     if self.direct_wandb_log:
                         wandb.log(log)
@@ -877,9 +841,9 @@ class ARMOR_Linear(CompressedLinear):
             trainable_sparse.naive_compression_module.compress_sparse_values()
 
         if quant_config.enabled:
-            trainable_sparse.naive_compression_module.quantize_sparse_values(quant_config.n_bits,
-                                                                             quant_config.group_size,
-                                                                             quant_config.symmetric) 
+            trainable_sparse.naive_compression_module.quantize_sparse_values(
+                quant_config.n_bits, quant_config.n_grid,
+                importance_weight=trainable_sparse.importance_weight)
         self.A = trainable_sparse.A
         self.B = trainable_sparse.B
         
@@ -996,14 +960,13 @@ class ARMOR_Linear(CompressedLinear):
         # print(kwargs["training_config"])
         training_config = instantiate(kwargs["training_config"])
 
-        if training_config.quant_enabled: 
+        if training_config.quant_enabled:
             print("Loading Quantized Weights")
             naive_cfg = copy.deepcopy(naive_compression_config)
             with open_dict(naive_cfg):
                 naive_cfg.init_config._target_ = "src.sparse_compress.QuantizedSparseLinear"
                 naive_cfg.compression_config.quant_n_bits = training_config.quant_n_bits
-                naive_cfg.compression_config.quant_group_size = training_config.quant_group_size
-                naive_cfg.compression_config.quant_symmetric = training_config.quant_symmetric
+                naive_cfg.compression_config.quant_n_grid = training_config.quant_n_grid
             
             self.naive_compression_module = utils.blank_init(
                 naive_cfg,

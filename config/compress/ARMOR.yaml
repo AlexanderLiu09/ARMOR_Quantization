@@ -30,7 +30,8 @@ compression_config:
   training_config:
     _target_: "src.ARMOR_compress.TrainingConfig"
     n_iters: 3000
-    n_continous_updates_per_iter: 1
+    n_W_updates_per_iter: 1
+    n_AB_updates_per_iter: 1
     n_sparse_core_updates_per_iter: 1
     sparse_core_step_select: "gradient_all_random"
     loss_atol: 1e-8
