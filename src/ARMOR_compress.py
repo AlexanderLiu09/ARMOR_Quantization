@@ -326,9 +326,21 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         group_idxs = torch.stack([idx_0, idx_1], dim=1) #shape of (n_blocks_total, 2)
 
         original_naive = trainable_sparse.naive_compression_module.reconstruct().clone()
-        #zero out the groups selected
 
-        original_naive[group_idxs[:, 0].unsqueeze(1), 
+        # When QAT is active, quantize/dequantize non-selected values so the residual
+        # matches the actual forward-pass reconstruction (quantized loss surface).
+        # Reuses row_scales already computed at the top of sparse_core_step.
+        if quant_config is not None and quant_config.enabled:
+            sparse_mask = trainable_sparse.naive_compression_module.sparse_mask
+            d_out = original_naive.shape[0]
+            nnz_per_row = sparse_mask.sum(dim=1)[0].item()
+            S_nonzero_rows = original_naive[sparse_mask].reshape(d_out, nnz_per_row)
+            q_max_snap = 2 ** (quant_config.n_bits - 1) - 1
+            S_quantized = torch.clamp(torch.round(S_nonzero_rows / row_scales[:, None]), -q_max_snap, q_max_snap) * row_scales[:, None]
+            original_naive[sparse_mask] = S_quantized.reshape(-1)
+
+        #zero out the groups selected
+        original_naive[group_idxs[:, 0].unsqueeze(1),
                       group_idxs[:, 1].unsqueeze(1) + torch.arange(group_size, device = group_idxs.device).unsqueeze(0)] = 0.0
 
         #use this to get W_remaining, the remaining weight matrix after subtracting the untouched subvectors
@@ -739,7 +751,7 @@ class ARMOR_Linear(CompressedLinear):
                 AB_optimizer.step()
 
 
-            loss_after_AB_step = trainable_sparse.recon_loss(reduction="mean").item()
+            loss_after_AB_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
             
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
@@ -801,7 +813,7 @@ class ARMOR_Linear(CompressedLinear):
                 if self.use_wandb:
                     log = {self.metric_name: current_loss,
                            "change/from_W": loss_after_W_step - loss_before_steps,
-                           "change/from_ABW": loss_after_AB_step - loss_after_W_step,
+                           "change/from_AB": loss_after_AB_step - loss_after_W_step,
                            "change/from_sparse": current_loss - loss_after_AB_step,
                            self.step_metric: i+1}
                     if self.direct_wandb_log:
