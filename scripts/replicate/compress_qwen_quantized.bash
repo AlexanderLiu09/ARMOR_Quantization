@@ -18,8 +18,8 @@ fi
 block_size=128
 n_iters=20000
 max_length=4096
-quant_n_bits=8
-quant_group_size=128
+quant_n_bits=4
+quant_n_grid=100
 quant_start=500
 
 
@@ -47,7 +47,7 @@ scripts/compress/ARMOR_quantized.bash run_name=${datetime} \
     dataset_config="[{dataset_config:${dataset},n_samples:128,ctx_len:8192}]" \
     gpus="${gpus}" \
     quant_n_bits=$quant_n_bits \
-    quant_group_size=$quant_group_size \
+    quant_n_grid=$quant_n_grid \
     quant_start=$quant_start > "${log_dir_use}/ARMOR_Q${quant_n_bits}_${block_size}_${n_iters}.log" 2>&1
 if [ $? -ne 0 ]; then
     echo "Compression failed for model: $model_name"

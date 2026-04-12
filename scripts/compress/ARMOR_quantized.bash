@@ -13,8 +13,8 @@ declare dataset_config="[{dataset_config:SlimPajama-627B,n_samples:128,ctx_len:8
 declare block_size=128 #default block size for BlockPrune
 declare n_iters=5000 #default number of iterations for BlockPrune
 declare additional_args=""
-declare quant_n_bits=8
-declare quant_group_size=128
+declare quant_n_bits=4
+declare quant_n_grid=100
 declare quant_start=500
 
 #loop through the args
@@ -52,7 +52,7 @@ cmd="CUDA_VISIBLE_DEVICES=${gpus} python -u ParallelCompress.py \
     +compress.compression_config.naive_compression_config.compression_config.pattern=[2,4] \
     compress.compression_config.training_config.n_iters=$n_iters \
     compress.compression_config.training_config.quant_n_bits=$quant_n_bits \
-    compress.compression_config.training_config.quant_group_size=$quant_group_size \
+    compress.compression_config.training_config.quant_n_grid=$quant_n_grid \
     compress.compression_config.training_config.quant_qat_start_iter=$quant_start
      \"datasets=${dataset_config}\""
 
