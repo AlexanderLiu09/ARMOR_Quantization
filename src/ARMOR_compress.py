@@ -27,7 +27,7 @@ from src.sparse_compress import SparseLinear
 from src.utils import normalizer as normalize
 from src.utils import utils
 from src.utils.blockwise_diag_matricies import BlockwiseDiagMatrix
-from src.utils.quantize import fake_quantize_per_row, find_optimal_scale_per_row, QuantConfig
+from src.utils.quantize import fake_quantize_per_row, find_optimal_scale_per_row, QuantConfig, STEQuantizePerRow
     
 class BlockCompressLearnable(nn.Module):
     original_weight: torch.FloatTensor
@@ -120,8 +120,11 @@ class BlockCompressLearnable(nn.Module):
                 col_indices = sparse_mask.nonzero(as_tuple=False)[:, 1].reshape(self.d_out, nnz_per_row)
                 hessian_weights = self.importance_weight[col_indices]
 
-            S_quantized = fake_quantize_per_row(S_nonzero_rows, quant_config.n_bits,
-                                                 quant_config.n_grid, hessian_weights)
+            scale = find_optimal_scale_per_row(S_nonzero_rows, quant_config.n_bits, 
+                                               quant_config.n_grid, hessian_weights)
+            self.cached_training_scale = scale
+            S_quantized = STEQuantizePerRow.apply(S_nonzero_rows, quant_config.n_bits,
+                                                  scale)
             S[sparse_mask] = S_quantized.reshape(-1)
 
         return self.A @ S @ self.B            
@@ -182,7 +185,6 @@ class SelectionConfig:
 @torch.no_grad()         
 def sparse_core_step(trainable_sparse: BlockCompressLearnable,
                             init_loss: float,
-                            print_this_iter: bool,
                             n_times: int = 1,
                             select: Literal["random", "gradient_greedy", "gradient_random"] = "random",
                             quant_config: Optional[QuantConfig] = None)-> None:
@@ -253,24 +255,11 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
     # precompute per-row quantization scales from the current full denormalized S
     row_scales = None
     if quant_config is not None and quant_config.enabled:
-        d_out = trainable_sparse.original_weight.shape[0]
-        d_in = trainable_sparse.original_weight.shape[1]
-        S_denorm = trainable_sparse.naive_compression_module.reconstruct()  # [d_out, d_in]
-        sparse_mask = trainable_sparse.naive_compression_module.sparse_mask
-        nnz_per_row = sparse_mask.sum(dim=1)[0].item()
-        S_nonzero_rows = S_denorm[sparse_mask].reshape(d_out, nnz_per_row)
-
-        hessian_weights = None
-        if trainable_sparse.importance_weight is not None:
-            col_indices = sparse_mask.nonzero(as_tuple=False)[:, 1].reshape(d_out, nnz_per_row)
-            hessian_weights = trainable_sparse.importance_weight[col_indices]
-
-        row_scales = find_optimal_scale_per_row(S_nonzero_rows, quant_config.n_bits,
-                                                 quant_config.n_grid, hessian_weights)
+        row_scales = trainable_sparse.cached_training_scale
 
         # precompute all possible integer value pairs (constant across iterations)
         q_max = 2 ** (quant_config.n_bits - 1) - 1
-        q_vals = torch.arange(-q_max, q_max + 1, device=S_denorm.device, dtype=S_denorm.dtype)
+        q_vals = torch.arange(-q_max, q_max + 1, device=trainable_sparse.device, dtype=torch.int8)
         q_pairs = torch.cartesian_prod(q_vals, q_vals)  # [n_q_pairs, n_nonzero]
         n_q_pairs = q_pairs.shape[0]
 
@@ -471,10 +460,9 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         trainable_sparse.naive_compression_module.X.data[group_idxs[:,0].unsqueeze(1),
                                                         optimal_non_zero_idxs + group_idxs[:,1].unsqueeze(1)] = sparse_values
 
-        if print_this_iter:
-            final_loss = trainable_sparse.recon_loss().item()
-            print(f"Sparse step decreased loss: {final_loss < init_loss}")
-            init_loss = final_loss
+        
+        final_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=quant_config).item()
+        assert final_loss < init_loss, "Sparse core step should decrease loss!"
         
         
                 
@@ -766,8 +754,7 @@ class ARMOR_Linear(CompressedLinear):
                 with torch.no_grad():
                     sparse_core_step(
                         trainable_sparse,
-                        None,
-                        print_this_iter,
+                        loss_after_W_step,
                         n_times=training_config.n_sparse_core_updates_per_iter,
                         select=training_config.sparse_core_step_select,
                         quant_config=active_quant_config,
