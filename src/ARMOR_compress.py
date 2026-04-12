@@ -479,7 +479,7 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         
                 
 @torch.no_grad()
-def calculate_gd_lr(trainable_sparse: BlockCompressLearnable, wrapper: str):
+def calculate_gd_lr(trainable_sparse: BlockCompressLearnable, weight: str):
     """
     Calculates local beta smoothness for A, B, and W wrappers.
     W uses the formula from ARMOR paper Appendix D.3 Eq. 12:
@@ -496,14 +496,14 @@ def calculate_gd_lr(trainable_sparse: BlockCompressLearnable, wrapper: str):
                                                                         col_block_size)
     D = trainable_sparse.naive_compression_module.hessianDiag.reshape(num_col_blocks,
                                                                       col_block_size)
-    if wrapper == "A":
+    if weight == "A":
         denom = torch.einsum("iajk,jk,ibjk->ijab", S, D, S).norm(dim=(-1, -2)).sum()
-    elif wrapper == "B":
+    elif weight == "B":
         S_prime = torch.einsum("iak,ikjb->iajb", trainable_sparse.A.diag_blocks, S)
         norm_1 = torch.einsum("ikja,ikjb->ijab", S_prime, S).norm(dim=(-1,- 2))
         norm_2 = D.norm(dim=-1)
         denom = torch.sum(norm_1 * norm_2)
-    elif wrapper == "W":
+    elif weight == "W":
         A_mat = trainable_sparse.A.diag_blocks  # (num_row_blocks, row_block_size, row_block_size)
         B_mat = trainable_sparse.B.diag_blocks  # (num_col_blocks, col_block_size, col_block_size)
         # ||A^T A||_F over block-diagonal A: sqrt of sum over blocks of ||A_i^T A_i||_F^2.
@@ -563,6 +563,7 @@ class TrainingConfig:
     log_freq: int = 1
     iter_save_path: Optional[str] = None
     iter_save_freq: int = -1
+    w_is_adam: bool = False
     #quantization
     quant_enabled: bool = False
     quant_n_bits: int = 4
@@ -683,20 +684,18 @@ class ARMOR_Linear(CompressedLinear):
             **block_diagonal_config,
         )
         
-
-        W_optimizer = initialize_optimizer(trainable_sparse=trainable_sparse,
-                                          optimizer_config=W_optimizer_config,
-                                          type = "core")
-        
+        if training_config.w_is_adam:
+            W_optimizer = initialize_optimizer(trainable_sparse=trainable_sparse,
+                                            optimizer_config=W_optimizer_config,
+                                            type = "core")
+            
+            lr_scheduler = None
+            if lr_scheduler_config is not None:
+                lr_scheduler = instantiate(lr_scheduler_config, optimizer=W_optimizer)
+            
         AB_optimizer = initialize_optimizer(trainable_sparse=trainable_sparse,
                                            optimizer_config=AB_optimizer_config,
                                            type = "wrapper")
-
-        #create the lr scheduler if configured
-        #lr shceduler only for W step
-        lr_scheduler = None
-        if lr_scheduler_config is not None:
-            lr_scheduler = instantiate(lr_scheduler_config, optimizer=W_optimizer)
 
         start_time = time.time()
         #create a simple logger
@@ -725,23 +724,8 @@ class ARMOR_Linear(CompressedLinear):
 
             #NOTE for debug
             loss_before_steps = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
-            # trainable_sparse.zero_grad()
-            #W optimizer step 
-            for _ in tqdm.tqdm(range(training_config.n_W_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
-                
-                #reset the optimizers
-                W_optimizer.zero_grad()   
 
-                loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
-                loss.backward()
-
-                #step the optimizers
-                W_optimizer.step()
-                if lr_scheduler is not None:
-                    lr_scheduler.step()
-            
-            loss_after_W_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
-
+            #AB adam step
             for _ in tqdm.tqdm(range(training_config.n_AB_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)): 
                 AB_optimizer.zero_grad()
 
@@ -750,8 +734,33 @@ class ARMOR_Linear(CompressedLinear):
 
                 AB_optimizer.step()
 
-
             loss_after_AB_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
+
+            #W optimizer step 
+            for _ in tqdm.tqdm(range(training_config.n_W_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
+                
+                if training_config.w_is_adam:
+                    #reset the optimizers
+                    W_optimizer.zero_grad()   
+
+                    loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
+                    loss.backward()
+
+                    #step the optimizers
+                    W_optimizer.step()
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
+                else:
+                    trainable_sparse.zero_grad(set_to_none=False)
+                    loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
+                    loss.backward()
+
+                    eta_W = calculate_gd_lr(trainable_sparse, "W")
+                    W = trainable_sparse.naive_compression_module.X
+                    with torch.no_grad():
+                        W.data -= eta_W * W.grad
+
+            loss_after_W_step = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
             
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
@@ -805,16 +814,16 @@ class ARMOR_Linear(CompressedLinear):
             # )
                 
             if i%training_config.log_freq == training_config.log_freq-1 or i==0:
-                W_current_lr = W_optimizer.param_groups[0]['lr']
+                W_current_lr = W_optimizer.param_groups[0]['lr'] if training_config.w_is_adam else eta_W
                 AB_current_lr = AB_optimizer.param_groups[0]['lr']
                 log_str = f"Iter: {i}, Loss: {current_loss}, AB LR:{AB_current_lr}, W LR: {W_current_lr:.2e}"
                 if self.verbose:
                     print(log_str)
                 if self.use_wandb:
                     log = {self.metric_name: current_loss,
-                           "change/from_W": loss_after_W_step - loss_before_steps,
-                           "change/from_AB": loss_after_AB_step - loss_after_W_step,
-                           "change/from_sparse": current_loss - loss_after_AB_step,
+                           "change/from_W": loss_after_W_step - loss_after_AB_step,
+                           "change/from_AB": loss_after_AB_step - loss_before_steps,
+                           "change/from_sparse": current_loss - loss_after_W_step,
                            self.step_metric: i+1}
                     if self.direct_wandb_log:
                         wandb.log(log)

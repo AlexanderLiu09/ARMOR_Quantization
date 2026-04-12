@@ -33,7 +33,8 @@ compression_config:
     n_W_updates_per_iter: 1
     n_AB_updates_per_iter: 1
     n_sparse_core_updates_per_iter: 1
-    sparse_core_step_select: "gradient_all_random"
+    w_is_adam: False
+    sparse_core_step_select: "gradient_all_random_Linf"
     loss_atol: 1e-8
     loss_rtol: 1e-6
     overall_patience: 200
