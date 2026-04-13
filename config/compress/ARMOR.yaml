@@ -15,17 +15,17 @@ compression_config:
 
   W_optimizer_config:
     _target_: "torch.optim.Adam"
-    lr: 5e-6   # was 0.0001 -- starting lr for cosine must be ≤ known-safe value
+    lr: 0.0001   # was 0.0001 -- starting lr for cosine must be ≤ known-safe value
     # weight_decay: 0.001
   
   AB_optimizer_config:
     _target_: "torch.optim.Adam"
     lr: 0.0001
 
-  lr_scheduler_config:
-    _target_: "torch.optim.lr_scheduler.CosineAnnealingLR"
-    T_max: ${..training_config.n_iters}
-    eta_min: 1.0e-6
+  # lr_scheduler_config:
+  #   _target_: "torch.optim.lr_scheduler.CosineAnnealingLR"
+  #   T_max: ${..training_config.n_iters}
+  #   eta_min: 1.0e-6
 
   training_config:
     _target_: "src.ARMOR_compress.TrainingConfig"
@@ -33,7 +33,7 @@ compression_config:
     n_W_updates_per_iter: 1
     n_AB_updates_per_iter: 1
     n_sparse_core_updates_per_iter: 1
-    w_is_adam: False
+    w_is_adam: True
     sparse_core_step_select: "gradient_all_random_Linf"
     loss_atol: 1e-8
     loss_rtol: 1e-6
