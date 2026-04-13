@@ -37,8 +37,8 @@ compression_config:
     sparse_core_step_select: "gradient_all_random_Linf"
     loss_atol: 1e-8
     loss_rtol: 1e-6
-    overall_patience: 200
-    log_freq: 100
+    overall_patience: 100
+    log_freq: 10
     # logging_path: "/data/lliu/PermPrune/test/permute.txt"
     # plotting_path: "/data/lliu/PermPrune/test/permute.png"
     # save_path: "/data/lliu/PermPrune/test/permute_{iter}.pt"

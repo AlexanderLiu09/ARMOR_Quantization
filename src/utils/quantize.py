@@ -8,7 +8,7 @@ from dataclasses import dataclass
 def find_optimal_scale_per_row(x_rows: torch.Tensor, n_bits: int,
                                 n_grid: int = 100,
                                 hessian_weights: Optional[torch.Tensor] = None,
-                                chunk_rows: int = 2048) -> torch.Tensor:
+                                chunk_rows: int = 4096) -> torch.Tensor:
     """
     Grid search for optimal per-row symmetric quantization scale.
 
