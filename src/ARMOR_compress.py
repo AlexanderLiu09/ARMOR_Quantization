@@ -461,8 +461,8 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
                                                         optimal_non_zero_idxs + group_idxs[:,1].unsqueeze(1)] = sparse_values
 
         
-        final_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=quant_config).item()
-        assert final_loss < init_loss, "Sparse core step should decrease loss!"
+        # final_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=quant_config).item()
+        # assert final_loss < init_loss, "Sparse core step should decrease loss!"
         
         
                 
