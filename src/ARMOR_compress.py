@@ -766,7 +766,7 @@ class ARMOR_Linear(CompressedLinear):
                     #reset the optimizers
                     W_optimizer.zero_grad()   
 
-                    loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config, recompute=True)
+                    loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config, recompute=True if i%10 == 0 else False)
                     loss.backward()
 
                     #step the optimizers
@@ -775,7 +775,7 @@ class ARMOR_Linear(CompressedLinear):
                         lr_scheduler.step()
                 else:
                     trainable_sparse.zero_grad(set_to_none=False)
-                    loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config, recompute=True)
+                    loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config, recompute=True if i%10 == 0 else False)
                     loss.backward()
 
                     eta_W = calculate_gd_lr(trainable_sparse, "W")

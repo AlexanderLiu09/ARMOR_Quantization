@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 @torch.no_grad()
 def find_optimal_scale_per_row(x_rows: torch.Tensor, n_bits: int,
-                                n_grid: int = 100,
+                                n_grid: int = 30,
                                 hessian_weights: Optional[torch.Tensor] = None,
                                 chunk_rows: int = 1024) -> torch.Tensor:
     """
