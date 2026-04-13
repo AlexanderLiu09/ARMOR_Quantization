@@ -104,7 +104,8 @@ class BlockCompressLearnable(nn.Module):
     #turn of gradient t
     def forward(self, permutations_to_ignore: Tuple[set[int],set[int]] = [{},{}], 
                 mask_kwargs: Optional[dict]= {},
-                quant_config: Optional[QuantConfig] = None):
+                quant_config: Optional[QuantConfig] = None, 
+                recompute: bool = False):
         S = self.naive_compression_module.reconstruct()
 
         #fake quantize all non zero values in S using per-row grid-searched scales
@@ -114,17 +115,18 @@ class BlockCompressLearnable(nn.Module):
             nnz_per_row = sparse_mask.sum(dim=1)[0].item()
             S_nonzero_rows = S[sparse_mask].reshape(self.d_out, nnz_per_row)
 
-            # get Hessian weights at nonzero positions for activation-aware scale search
-            hessian_weights = None
-            if self.importance_weight is not None:
-                col_indices = sparse_mask.nonzero(as_tuple=False)[:, 1].reshape(self.d_out, nnz_per_row)
-                hessian_weights = self.importance_weight[col_indices]
+            if recompute:
+                # get Hessian weights at nonzero positions for activation-aware scale search
+                hessian_weights = None
+                if self.importance_weight is not None:
+                    col_indices = sparse_mask.nonzero(as_tuple=False)[:, 1].reshape(self.d_out, nnz_per_row)
+                    hessian_weights = self.importance_weight[col_indices]
 
-            scale = find_optimal_scale_per_row(S_nonzero_rows, quant_config.n_bits, 
-                                               quant_config.n_grid, hessian_weights)
-            self.cached_training_scale = scale
+                scale = find_optimal_scale_per_row(S_nonzero_rows, quant_config.n_bits, 
+                                                quant_config.n_grid, hessian_weights)
+                self.cached_training_scale = scale
             S_quantized = STEQuantizePerRow.apply(S_nonzero_rows, quant_config.n_bits,
-                                                  scale)
+                                                  self.cached_training_scale)
             S[sparse_mask] = S_quantized.reshape(-1)
 
         return self.A @ S @ self.B            
@@ -708,7 +710,7 @@ class ARMOR_Linear(CompressedLinear):
 
             if quant_config is not None and i == quant_config.qat_start_iter:
                 remaining_patience = training_config.overall_patience
-                prev_iter_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
+                prev_iter_loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config, recompute=True).item()
 
             #NOTE for debug
             loss_before_steps = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config).item()
@@ -731,7 +733,7 @@ class ARMOR_Linear(CompressedLinear):
                     #reset the optimizers
                     W_optimizer.zero_grad()   
 
-                    loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
+                    loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config, recompute=True)
                     loss.backward()
 
                     #step the optimizers
@@ -740,7 +742,7 @@ class ARMOR_Linear(CompressedLinear):
                         lr_scheduler.step()
                 else:
                     trainable_sparse.zero_grad(set_to_none=False)
-                    loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config)
+                    loss = trainable_sparse.recon_loss(reduction="mean", quant_config=active_quant_config, recompute=True)
                     loss.backward()
 
                     eta_W = calculate_gd_lr(trainable_sparse, "W")
