@@ -259,7 +259,7 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
 
         # precompute all possible integer value pairs (constant across iterations)
         q_max = 2 ** (quant_config.n_bits - 1) - 1
-        q_vals = torch.arange(-q_max, q_max + 1, device=trainable_sparse.device, dtype=torch.int8)
+        q_vals = torch.arange(-q_max, q_max + 1, device=trainable_sparse.original_weight.device, dtype=torch.int8)
         q_pairs = torch.cartesian_prod(q_vals, q_vals)  # [n_q_pairs, n_nonzero]
         n_q_pairs = q_pairs.shape[0]
 
