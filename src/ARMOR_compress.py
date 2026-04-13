@@ -259,12 +259,6 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
     if quant_config is not None and quant_config.enabled:
         row_scales = trainable_sparse.cached_training_scale
 
-        # precompute all possible integer value pairs (constant across iterations)
-        q_max = 2 ** (quant_config.n_bits - 1) - 1
-        q_vals = torch.arange(-q_max, q_max + 1, device=trainable_sparse.original_weight.device, dtype=torch.int8)
-        q_pairs = torch.cartesian_prod(q_vals, q_vals)  # [n_q_pairs, n_nonzero]
-        n_q_pairs = q_pairs.shape[0]
-
     for i in range(n_times):
         
         # selection code
@@ -369,15 +363,36 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         g_all = first_order_term[:, possible_non_zero_idxs] #shape of (n_blocks_total, n_possible, n_nonzero)
 
         if quant_config is not None and quant_config.enabled:
-            #=== Quantization-aware path: exhaustive enumeration over (pattern, q1, q2) ===
+            #=== Quantization-aware path: solve-then-snap ===
+            # 1. Cholesky solve for continuous optimal across all 6 patterns
+            # 2. Snap to floor/ceil corners on quantization grid
+            # 3. Evaluate cost for n_possible patterns × 2^n_nonzero corners
 
+            q_max = 2 ** (quant_config.n_bits - 1) - 1
             H = B_squared.view(n_blocks_total, n_possible, n_nonzero, n_nonzero)
-            a_sq = (a ** 2).sum(dim=1) #shape of (n_blocks_total,)
+            a_sq = (a ** 2).sum(dim=1)  # [n_blocks_total]
 
-            # compute denorm factors for ALL patterns (not just the winner)
-            rows = group_idxs[:, 0]  # (n_blocks_total,)
+            # Cholesky solve for continuous optimal
+            diag_mean = B_squared.diagonal(dim1=-2, dim2=-1).mean(dim=-1).view(-1, 1, 1)
+            B_squared += torch.eye(n_nonzero, device=B.device) * (diag_mean * 1e-7 + 1e-9)
+            L, info = torch.linalg.cholesky_ex(B_squared)
+            if (info != 0).any():
+                failed = (info != 0)
+                fail_rate = failed.float().mean().item()
+                if fail_rate > 0.001:
+                    print(f"  cholesky retry fired on {fail_rate*100:.2f}% of blocks")
+                B_squared[failed] += torch.eye(n_nonzero, device=B.device) * 1e-3
+                L[failed] = torch.linalg.cholesky_ex(B_squared[failed])[0]
+            B_squared_inv = torch.cholesky_inverse(L)
+
+            g_half = (0.5 * g_all).view(n_blocks_total * n_possible, n_nonzero, 1)
+            s_all = -torch.bmm(B_squared_inv, g_half).squeeze(2)
+            s_all = s_all.view(n_blocks_total, n_possible, n_nonzero)
+            s_all = s_all / (a_sq[:, None, None] + trainable_sparse.eps)
+
+            # Compute denorm factors for all patterns
+            rows = group_idxs[:, 0]
             all_cols = possible_non_zero_idxs[None, :, :] + group_idxs[:, 1].unsqueeze(1).unsqueeze(2)
-            # all_cols shape: [n_blocks_total, n_possible, n_nonzero]
 
             naive_normalizer = trainable_sparse.naive_compression_module.normalizer
             denorm_factor_all = torch.ones(n_blocks_total, n_possible, n_nonzero, device=a.device, dtype=a.dtype)
@@ -385,39 +400,57 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
                 dim = naive_normalizer.norm_order[j_norm]
                 norm = naive_normalizer.norms[j_norm]
                 if norm is not None and norm.numel() > 0:
-                    if dim == 0:  # column norm, indexed by col
+                    if dim == 0:
                         denorm_factor_all = denorm_factor_all * norm[all_cols]
-                    elif dim == 1:  # row norm, indexed by row
+                    elif dim == 1:
                         denorm_factor_all = denorm_factor_all * norm[rows][:, None, None]
 
-            # convert integer pairs to normalized-space candidates
-            # s_norm = q_int * row_scale / denorm_factor
-            scales_for_blocks = row_scales[rows]  # (n_blocks_total,)
+            scales_for_blocks = row_scales[rows]  # [n_blocks_total]
+
+            # Convert continuous optimal to denormalized space and snap to quant grid
+            s_denorm = s_all * denorm_factor_all                             # [n_blocks, n_possible, n_nonzero]
+            s_scaled = s_denorm / scales_for_blocks[:, None, None]           # in integer units
+
+            q_floor = torch.floor(s_scaled).clamp(-q_max, q_max)
+            q_ceil = torch.ceil(s_scaled).clamp(-q_max, q_max)
+
+            # Generate all 2^n_nonzero floor/ceil corner combinations
+            n_corners = 2 ** n_nonzero
+            corner_bits = torch.arange(n_corners, device=a.device)
+            bit_positions = torch.arange(n_nonzero, device=a.device)
+            use_ceil = ((corner_bits[:, None] >> bit_positions[None, :]) & 1).bool()  # [n_corners, n_nonzero]
+
+            q_corners = torch.where(
+                use_ceil[None, None, :, :],                                  # [1, 1, n_corners, n_nonzero]
+                q_ceil[:, :, None, :],                                       # [n_blocks, n_possible, 1, n_nonzero]
+                q_floor[:, :, None, :]                                       # [n_blocks, n_possible, 1, n_nonzero]
+            )  # [n_blocks_total, n_possible, n_corners, n_nonzero]
+
+            # Convert corners to normalized space: s_norm = q_int * scale / denorm_factor
             s_candidates = (
-                q_pairs[None, None, :, :]                      # [1, 1, n_q_pairs, n_nonzero]
-                * scales_for_blocks[:, None, None, None]        # [n_blocks, 1, 1, 1]
-                / denorm_factor_all[:, :, None, :]              # [n_blocks, n_possible, 1, n_nonzero]
-            )  # [n_blocks_total, n_possible, n_q_pairs, n_nonzero]
+                q_corners * scales_for_blocks[:, None, None, None]           # integer → denorm
+                / denorm_factor_all[:, :, None, :]                           # denorm → norm
+            )  # [n_blocks_total, n_possible, n_corners, n_nonzero]
 
-            # evaluate quadratic cost: a_sq * s^T H s + g^T s
-            Hs = torch.einsum('bpij,bpqj->bpqi', H, s_candidates)
-            sHs = (s_candidates * Hs).sum(dim=-1)               # [n_blocks, n_possible, n_q_pairs]
-            gs = (g_all[:, :, None, :] * s_candidates).sum(dim=-1)  # [n_blocks, n_possible, n_q_pairs]
-            cost = a_sq[:, None, None] * sHs + gs               # [n_blocks, n_possible, n_q_pairs]
+            # Evaluate quadratic cost: a_sq * s^T H s + g^T s
+            Hs = torch.einsum('bpij,bpcj->bpci', H, s_candidates)
+            sHs = (s_candidates * Hs).sum(dim=-1)                            # [n_blocks, n_possible, n_corners]
+            gs = (g_all[:, :, None, :] * s_candidates).sum(dim=-1)           # [n_blocks, n_possible, n_corners]
+            cost = a_sq[:, None, None] * sHs + gs                            # [n_blocks, n_possible, n_corners]
 
-            # find best (pattern, q_pair) per block
-            cost_flat = cost.reshape(n_blocks_total, n_possible * n_q_pairs)
-            best_flat_idx = cost_flat.argmin(dim=1)              # [n_blocks_total]
+            # Find best (pattern, corner) per block
+            cost_flat = cost.reshape(n_blocks_total, n_possible * n_corners)
+            best_flat_idx = cost_flat.argmin(dim=1)                           # [n_blocks_total]
 
-            optimal_mask = best_flat_idx // n_q_pairs            # which pattern
-            best_q_idx = best_flat_idx % n_q_pairs               # which q_pair
+            optimal_mask = best_flat_idx // n_corners
+            best_corner_idx = best_flat_idx % n_corners
 
-            optimal_non_zero_idxs = possible_non_zero_idxs[optimal_mask]  # [n_blocks, n_nonzero]
-            optimal_q_pair = q_pairs[best_q_idx]                          # [n_blocks, n_nonzero]
-
-            # convert winning q_pair to normalized space for writing to X.data
-            winning_denorm = denorm_factor_all[torch.arange(n_blocks_total, device=a.device), optimal_mask]
-            sparse_values = optimal_q_pair * scales_for_blocks[:, None] / winning_denorm
+            optimal_non_zero_idxs = possible_non_zero_idxs[optimal_mask]
+            sparse_values = s_candidates[
+                torch.arange(n_blocks_total, device=a.device),
+                optimal_mask,
+                best_corner_idx
+            ]  # [n_blocks_total, n_nonzero]
 
         else:
             #=== Non-quantized path: closed-form continuous solve ===
