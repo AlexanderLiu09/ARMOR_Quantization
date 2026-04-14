@@ -304,16 +304,39 @@ class SparseLinear(compression_parent.CompressedLinear):
 
     @torch.no_grad()
     def quantize_sparse_values(self, n_bits, n_grid=100, importance_weight=None):
-        """Quantizes non-zero sparse values using per-row grid-searched scales.
+        """Quantizes non-zero sparse values in DENORMALIZED space using per-row
+        grid-searched scales, then absorbs the normalizer into the quantized values
+        by resetting norms to 1 and zeros to 0.
+
+        Rationale: training's fake-quant operates on denormalized S (see ARMOR_compress
+        forward), so the scale training optimized against is a denorm-space per-row
+        scale. Quantizing self.X directly (which lives in normalized space) and then
+        relying on self.normalizer.denormalize at reconstruction time produces an
+        effective per-element scale s_norm_i * r_i * c_j, which is NOT what training
+        saw and is also incompatible with SparseMarlin's per-output-channel scale.
+
+        By denormalizing first, quantizing, and collapsing the normalizer to identity,
+        we make `scale` the true per-row scale of the reconstructed weight, which both
+        matches training and is directly usable by SparseMarlin.
 
         Args:
             n_bits: Bit width for quantization.
             n_grid: Grid search resolution for optimal scale.
-            importance_weight: Optional [d_in] Hessian diagonal for activation-aware scales.
+            importance_weight: Optional [d_in] Hessian diagonal for activation-aware
+                scales. Stays in original activation space — normalization is on the
+                weight side and does not change input activations.
         """
         assert len(self.X.shape) == 1, "X should be 1D"
         nnz_per_row = self.sparse_mask.sum(dim=1)[0].item()
-        X_rows = self.X.data.reshape(self.out_features, nnz_per_row)
+
+        # Reconstruct denormalized S to quantize in the space training optimized against.
+        S_norm_2d = torch.zeros(
+            (self.out_features, self.in_features),
+            device=self.X.device, dtype=self.X.dtype,
+        )
+        S_norm_2d[self.sparse_mask] = self.X.data
+        S_denorm_2d = self.normalizer.denormalize(S_norm_2d)
+        X_rows = S_denorm_2d[self.sparse_mask].reshape(self.out_features, nnz_per_row)
 
         # get Hessian weights at nonzero positions
         hessian_weights = None
@@ -327,8 +350,18 @@ class SparseLinear(compression_parent.CompressedLinear):
 
         del self.X
 
-        self.register_buffer("X_int", X_int)        # [d_out, nnz_per_row]
-        self.register_buffer("scale", scale)         # [d_out]
+        self.register_buffer("X_int", X_int)        # [d_out, nnz_per_row] (denorm-space)
+        self.register_buffer("scale", scale)         # [d_out] (denorm-space per-row)
+
+        # Absorb denormalization: reset normalizer to identity so the unconditional
+        # self.normalizer.denormalize(...) call inside reconstruct_quantized_ becomes
+        # a no-op. Keeps the reconstruct code path unchanged.
+        for j in range(len(self.normalizer.norms)):
+            if self.normalizer.norms[j] is not None and self.normalizer.norms[j].numel() > 0:
+                self.normalizer.norms[j].data.fill_(1.0)
+        for j in range(len(self.normalizer.zeros)):
+            if self.normalizer.zeros[j] is not None and self.normalizer.zeros[j].numel() > 0:
+                self.normalizer.zeros[j].data.fill_(0.0)
 
         self.quant_n_bits = n_bits
         self.quant_n_grid = n_grid
