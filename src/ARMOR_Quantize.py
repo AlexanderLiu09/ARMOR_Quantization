@@ -226,16 +226,16 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
     )  # (n_possible, n_nonzero)
     n_possible = possible_non_zero_idxs.shape[0]
 
-    # ---- integer-quant enumeration over the full clamp range ----
+    # ---- quantization range and number of floor/ceil combos ----
     q_min, q_max = naive.quant_range
-    q_vals = torch.arange(q_min, q_max + 1, device=device, dtype=dtype)
-    if n_nonzero == 1:
-        q_pairs = q_vals.unsqueeze(1)
-    else:
-        q_pairs = torch.cartesian_prod(*([q_vals] * n_nonzero))  # (n_q^n_nonzero, n_nonzero)
-    n_q_pairs = q_pairs.shape[0]
-    if n_possible * n_q_pairs > 10000:
-        print(f"Warning: {n_possible * n_q_pairs} (pattern, q) candidates per block; this may be slow.")
+    # For each pattern, each nonzero weight has 2 candidates (floor, ceil of wm*/scale).
+    # With n_nonzero=2 this gives 2^2=4 combos per pattern → 6*4=24 total candidates.
+    n_combos = 2 ** n_nonzero
+    # Combo selector: (n_combos, n_nonzero) binary flags; bit i of c → 0=floor, 1=ceil
+    combo_flags = torch.tensor(
+        [[int((c >> i) & 1) for i in range(n_nonzero)] for c in range(n_combos)],
+        device=device, dtype=dtype,
+    )  # (n_combos, n_nonzero)
 
     selection_config = SelectionConfig.from_name(select)
     col_range = torch.arange(group_size, device=device)
@@ -311,38 +311,67 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
             a.unsqueeze(2),
         ).squeeze(2)
 
-        # per-pattern H_p = B_p B_p^T
+        # ---- per-pattern H_p = B_p B_p^T and its inverse ----
         B_selected = B[:, possible_non_zero_idxs, :]  # (b, n_possible, n_nonzero, block_size_1)
-        B_squared = torch.bmm(
+        B_sq = torch.bmm(
             B_selected.reshape(-1, n_nonzero, block_size_1),
             B_selected.reshape(-1, n_nonzero, block_size_1).transpose(1, 2),
+        ).view(n_blocks_total, n_possible, n_nonzero, n_nonzero)
+        # Damped inverse via Cholesky (same as non-quantized ARMOR_compress.py)
+        eye = torch.eye(n_nonzero, device=device, dtype=dtype).view(1, 1, n_nonzero, n_nonzero)
+        B_sq_inv = torch.cholesky_inverse(
+            torch.linalg.cholesky_ex(B_sq + eye * 1e-9)[0].reshape(-1, n_nonzero, n_nonzero)
         ).view(n_blocks_total, n_possible, n_nonzero, n_nonzero)
 
         g_all = first_order_term[:, possible_non_zero_idxs]  # (b, n_possible, n_nonzero)
         a_sq = (a ** 2).sum(dim=1)  # (n_blocks_total,)
 
-        # ---- per-block scales (one scale per 4-group since sparse group fits inside quant group) ----
+        # ---- continuous LS optimum per pattern: wm*_p = -(H_p^{-1} @ (g_p/2)) / ||a||^2 ----
+        rhs = (g_all / 2.0).unsqueeze(-1)  # (b, n_possible, n_nonzero, 1)
+        wm_star = -torch.bmm(
+            B_sq_inv.reshape(-1, n_nonzero, n_nonzero),
+            rhs.reshape(-1, n_nonzero, 1),
+        ).view(n_blocks_total, n_possible, n_nonzero) / (
+            a_sq.view(-1, 1, 1) + trainable_sparse.eps
+        )  # (b, n_possible, n_nonzero)
+
+        # ---- per-block scales ----
         scale_idx = idx_1 // groupsize  # (n_blocks_total,)
         scales_for_blocks = naive.scales[idx_0, scale_idx, 0]  # (n_blocks_total,)
+        scale = scales_for_blocks.view(-1, 1, 1)  # (b, 1, 1) for broadcasting
 
-        # ---- joint exhaustive enumeration over (pattern p, integer tuple q) ----
-        # cost(p, q) = c0 * q^T H_p q + c1 * g_p^T q
-        # with c0 = a_sq * scale^2, c1 = scale (because sparse value s = q * scale)
-        Hq = torch.einsum('bpij,qj->bpqi', B_squared, q_pairs)
-        qHq = torch.einsum('qi,bpqi->bpq', q_pairs, Hq)
-        gq = torch.einsum('bpi,qi->bpq', g_all, q_pairs)
-        c0 = (a_sq * scales_for_blocks ** 2).view(-1, 1, 1)
-        c1 = scales_for_blocks.view(-1, 1, 1)
-        cost = c0 * qHq + c1 * gq  # (n_blocks_total, n_possible, n_q_pairs)
+        # ---- build floor/ceil candidates: 2^n_nonzero combos per pattern ----
+        # q_lo/q_hi: integer codes bracketing the continuous optimum, clamped to quant range
+        wm_over_s = wm_star / scale                               # (b, n_possible, n_nonzero)
+        q_lo = torch.floor(wm_over_s).clamp(q_min, q_max)        # (b, n_possible, n_nonzero)
+        q_hi = torch.ceil(wm_over_s).clamp(q_min, q_max)         # (b, n_possible, n_nonzero)
 
-        cost_flat = cost.reshape(n_blocks_total, n_possible * n_q_pairs)
-        best_flat_idx = cost_flat.argmin(dim=1)
-        optimal_pattern_idx = best_flat_idx // n_q_pairs
-        optimal_q_idx = best_flat_idx % n_q_pairs
+        # q_combos[b, p, c, i]: integer code for entry i, combo c, pattern p, block b
+        # = q_lo[b,p,i] + combo_flags[c,i] * (q_hi[b,p,i] - q_lo[b,p,i])
+        q_delta = (q_hi - q_lo).unsqueeze(-2)  # (b, n_possible, 1, n_nonzero)
+        q_combos = q_lo.unsqueeze(-2) + combo_flags.view(1, 1, n_combos, n_nonzero) * q_delta
+        # shape (b, n_possible, n_combos, n_nonzero) = (b, 6, 4, 2) for 2:4 INT4
+
+        # ---- evaluate cost(p, combo) = c0 * q^T H_p q + c1 * g_p^T q ----
+        # c0 = a_sq * scale^2,  c1 = scale  (since s = q * scale)
+        c0 = (a_sq * scales_for_blocks ** 2).view(-1, 1, 1, 1)  # (b, 1, 1, 1)
+        c1 = scales_for_blocks.view(-1, 1, 1, 1)                # (b, 1, 1, 1)
+        # H_p @ q_combo: einsum over last dim j of B_sq and q_combos
+        Hq  = torch.einsum('bpij,bpcj->bpci', B_sq, q_combos)  # (b, 6, 4, 2)
+        qHq = (q_combos * Hq).sum(dim=-1)                       # (b, 6, 4)
+        gq  = (g_all.unsqueeze(-2) * q_combos).sum(dim=-1)      # (b, 6, 4)
+        cost = c0 * qHq + c1 * gq                               # (b, 6, 4)
+
+        # ---- argmin over 6 * 4 = 24 candidates ----
+        cost_flat = cost.reshape(n_blocks_total, n_possible * n_combos)  # (b, 24)
+        best_flat_idx = cost_flat.argmin(dim=1)                           # (b,)
+        optimal_pattern_idx = best_flat_idx // n_combos                   # (b,) in [0, 6)
+        optimal_combo_idx   = best_flat_idx %  n_combos                   # (b,) in [0, 4)
 
         optimal_non_zero_idxs = possible_non_zero_idxs[optimal_pattern_idx]  # (b, n_nonzero)
-        optimal_q_pair = q_pairs[optimal_q_idx]                               # (b, n_nonzero)
-        sparse_values = optimal_q_pair * scales_for_blocks.unsqueeze(1)       # (b, n_nonzero)
+        b_idx = torch.arange(n_blocks_total, device=device)
+        optimal_q = q_combos[b_idx, optimal_pattern_idx, optimal_combo_idx]  # (b, n_nonzero)
+        sparse_values = optimal_q * scales_for_blocks.unsqueeze(1)           # (b, n_nonzero)
 
         # ---- write updated mask (clear the 4-group, set the chosen nonzeros) ----
         naive.sparse_mask[group_idxs[:, 0].unsqueeze(1),
@@ -490,6 +519,7 @@ class QuantizedARMOR_Linear(CompressedLinear):
                            self.step_metric: 1})
             # best_state_dict = copy.deepcopy(trainable_sparse.state_dict())
             
+        remaining_patience = training_config.overall_patience
         for i in tqdm.tqdm(range(training_config.n_iters), disable = not self.verbose):
             
             #optimizer step
