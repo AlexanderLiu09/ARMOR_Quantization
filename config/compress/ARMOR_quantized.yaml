@@ -1,10 +1,12 @@
 defaults:
   - ARMOR
+  - override ./@compression_config.naive_compression_config: prune_quantize
   - _self_
 
+init_config:
+  _target_: "src.ARMOR_Quantize.QuantizedARMOR_Linear"
+  verbose: True
 compression_config:
   training_config:
-    quant_enabled: true
-    quant_n_bits: 4
-    quant_n_grid: 100
-    quant_qat_start_iter: 500
+    log_freq: 1000
+    n_sparse_core_updates_per_iter: 0

@@ -10,7 +10,6 @@ import wandb
 from typing import Tuple, Optional, Union, List, Literal
 import src.utils.normalizer as normalize
 import src.compression_parent as compression_parent
-from src.utils.quantize import quantize_per_row, dequantize_per_row, find_optimal_scale_per_row
 
 class SparseCheckError(Exception):
     """Custom exception for sparse check errors."""
@@ -51,7 +50,6 @@ def get_group_and_n_nonzero(
 class SparseLinear(compression_parent.CompressedLinear):
     name = "SparseLinear"
     compression_measure = "parameters"
-    quantized = False 
 
     @torch.no_grad()
     def sparsify(
@@ -167,20 +165,11 @@ class SparseLinear(compression_parent.CompressedLinear):
                     self.bias,
                 )
         else:
-            assert (
-                self.denormalization_method == "otf"
-            ), "on the fly denormalization is only supported for on the fly sparsity"
-            x = self.normalizer.denormalize_otf_in(x)
-            y = torch.zeros(list(x.shape[:-1]) + [self.out_features], device=x.device)
-            for sparse_module in self.sparse_modules:
-                if sparse_module is not None:
-                    y = y + sparse_module(x)
-            y = self.normalizer.denormalize_otf_out(y) + (
-                self.bias if self.bias is not None else 0
-            )
+            raise DeprecationWarning(f"forward method {self.forward_method} not implemented")
         return y
 
     def get_n_bits(self):
+        raise DeprecationWarning("get_n_bits is not no longer supported for SparseLinear, since it is not quantized. Use get_n_nonzero instead.")
         n_bits = 0
         if self.compressed:
             for sparse_module in self.sparse_modules:
@@ -235,27 +224,13 @@ class SparseLinear(compression_parent.CompressedLinear):
         # print("original weight shape", self.original_weight.shape)
 
     def reconstruct_(self, denormalize: bool = True) -> torch.FloatTensor:
-        """reconstructs the weight matrix from the sparse values"""
+        """reconstructs the weigth matrix from the quantized version"""
         # print("reconstructing")
-        if self.quantized:
-            return self.reconstruct_quantized_(denormalize)
         if len(self.X.shape) == 1:
             reconstructed = torch.zeros((self.out_features, self.in_features), device=self.X.device, dtype=self.X.dtype)
             reconstructed[self.sparse_mask] = self.X
         else:
             reconstructed = self.X * self.sparse_mask
-
-        if denormalize:
-            reconstructed = self.normalizer.denormalize(reconstructed)
-
-        return reconstructed
-    
-    def reconstruct_quantized_(self, denormalize: bool = True) -> torch.FloatTensor:
-        """same as reconstruct_() but dequantizes first using per-row scales"""
-        X_float = dequantize_per_row(self.X_int, self.scale)  # [d_out, nnz_per_row]
-
-        reconstructed = torch.zeros((self.out_features, self.in_features), device=X_float.device, dtype=X_float.dtype)
-        reconstructed[self.sparse_mask] = X_float.reshape(-1)
 
         if denormalize:
             reconstructed = self.normalizer.denormalize(reconstructed)
@@ -282,92 +257,6 @@ class SparseLinear(compression_parent.CompressedLinear):
         """Uncompress the sparse values to their original shape"""
         self.X = nn.Parameter(
             self.reconstruct_(denormalize=False).detach().clone())
-        
-    # def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-    #     # If X_int is in the state dict, this was a quantized checkpoint.
-    #     # Restore metadata attributes that aren't saved in state_dict.
-    #     if prefix + "X_int" in state_dict:
-    #         self.quantized = True
-    #         if hasattr(self, 'X'):
-    #             del self.X
-    #         if not hasattr(self, 'X_int'):
-    #             self.register_buffer("X_int", torch.empty(0))
-    #         if not hasattr(self, 'scale'):
-    #             self.register_buffer("scale", torch.empty(0))
-    #         if not hasattr(self, 'zero_point'):
-    #             self.register_buffer("zero_point", torch.empty(0))
-    #     super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-    #     if self.quantized and not hasattr(self, 'quant_n_bits'):
-    #         self.quant_n_bits = 8
-    #         self.quant_group_size = 128
-    #         self.quant_symmetric = True
-
-    @torch.no_grad()
-    def quantize_sparse_values(self, n_bits, n_grid=100, importance_weight=None):
-        """Quantizes non-zero sparse values in DENORMALIZED space using per-row
-        grid-searched scales, then absorbs the normalizer into the quantized values
-        by resetting norms to 1 and zeros to 0.
-
-        Rationale: training's fake-quant operates on denormalized S (see ARMOR_compress
-        forward), so the scale training optimized against is a denorm-space per-row
-        scale. Quantizing self.X directly (which lives in normalized space) and then
-        relying on self.normalizer.denormalize at reconstruction time produces an
-        effective per-element scale s_norm_i * r_i * c_j, which is NOT what training
-        saw and is also incompatible with SparseMarlin's per-output-channel scale.
-
-        By denormalizing first, quantizing, and collapsing the normalizer to identity,
-        we make `scale` the true per-row scale of the reconstructed weight, which both
-        matches training and is directly usable by SparseMarlin.
-
-        Args:
-            n_bits: Bit width for quantization.
-            n_grid: Grid search resolution for optimal scale.
-            importance_weight: Optional [d_in] Hessian diagonal for activation-aware
-                scales. Stays in original activation space — normalization is on the
-                weight side and does not change input activations.
-        """
-        assert len(self.X.shape) == 1, "X should be 1D"
-        nnz_per_row = self.sparse_mask.sum(dim=1)[0].item()
-
-        # Reconstruct denormalized S to quantize in the space training optimized against.
-        S_norm_2d = torch.zeros(
-            (self.out_features, self.in_features),
-            device=self.X.device, dtype=self.X.dtype,
-        )
-        S_norm_2d[self.sparse_mask] = self.X.data
-        S_denorm_2d = self.normalizer.denormalize(S_norm_2d)
-        X_rows = S_denorm_2d[self.sparse_mask].reshape(self.out_features, nnz_per_row)
-
-        # get Hessian weights at nonzero positions
-        hessian_weights = None
-        if importance_weight is not None:
-            col_indices = self.sparse_mask.nonzero(as_tuple=False)[:, 1].reshape(
-                self.out_features, nnz_per_row)
-            hessian_weights = importance_weight[col_indices]
-
-        scale = find_optimal_scale_per_row(X_rows, n_bits, n_grid, hessian_weights)
-        X_int, scale = quantize_per_row(X_rows, n_bits, scale)
-
-        del self.X
-
-        self.register_buffer("X_int", X_int)        # [d_out, nnz_per_row] (denorm-space)
-        self.register_buffer("scale", scale)         # [d_out] (denorm-space per-row)
-
-        # Absorb denormalization: reset normalizer to identity so the unconditional
-        # self.normalizer.denormalize(...) call inside reconstruct_quantized_ becomes
-        # a no-op. Keeps the reconstruct code path unchanged.
-        for j in range(len(self.normalizer.norms)):
-            if self.normalizer.norms[j] is not None and self.normalizer.norms[j].numel() > 0:
-                self.normalizer.norms[j].data.fill_(1.0)
-        for j in range(len(self.normalizer.zeros)):
-            if self.normalizer.zeros[j] is not None and self.normalizer.zeros[j].numel() > 0:
-                self.normalizer.zeros[j].data.fill_(0.0)
-
-        self.quant_n_bits = n_bits
-        self.quant_n_grid = n_grid
-        self.quantized = True
-
-
         
     def check_mask(self, 
                    mask: Optional[torch.Tensor] = None,
@@ -411,41 +300,3 @@ class SparseLinear(compression_parent.CompressedLinear):
                     print(f"mask at non-zero indices: {self.sparse_mask[non_zero_idx_i, non_zero_idx_j:non_zero_idx_j + self.sparse_group]}")
                     print(f"mask is not correct, expected at most {self.n_non_zero_per_group} non-zero elements per group, got {mask_sum[mask_sum > self.n_non_zero_per_group]} non-zero elements")
                 raise SparseCheckError
-            
-class QuantizedSparseLinear(SparseLinear):
-    name = "QuantizedSparseLinear"
-    quantized = True
-
-    @torch.no_grad
-    def blank_recreate(self,
-        frac_nonzero: float = 0.1,
-        pattern: Optional[Tuple[int, int]] = None,
-        sparse_group: Optional[int] = None,
-        normalizer_kwargs: Optional[dict] = None,
-        normalizer: Optional[normalize.Normalizer] = None,
-        quant_n_bits: int = 4,
-        quant_n_grid: int = 100,
-        **kwargs):
-        """Same as super().blank_recreate but instantiate quantized buffers instead.
-
-        Buffers use per-row layout: X_int is [d_out, nnz_per_row], scale is [d_out].
-        """
-
-        super().blank_recreate(frac_nonzero, pattern, sparse_group,
-                               normalizer_kwargs, normalizer, **kwargs)
-        del self.X
-
-        nnz_per_row = self.n_non_zero_per_group * self.in_features // self.sparse_group
-
-        self.register_buffer("X_int", torch.zeros(self.out_features, nnz_per_row,
-                                                  dtype=torch.int8,
-                                                  device=self.original_weight.device))
-        self.register_buffer("scale", torch.ones(self.out_features,
-                                                  dtype=self.original_weight.dtype,
-                                                  device=self.original_weight.device))
-
-        self.quant_n_bits = quant_n_bits
-        self.quant_n_grid = quant_n_grid
-
-
-
