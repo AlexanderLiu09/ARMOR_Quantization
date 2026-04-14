@@ -10,14 +10,14 @@ import wandb
 from typing import Tuple, Optional, Union, List, Literal
 import src.utils.normalizer as normalize
 import src.compression_parent as compression_parent
-from src.sparse_compress import SparseLinear
+from src.sparse_compress import SparseLinear, get_group_and_n_nonzero
 
 
 
 
 class QuantizedSparseLinear(SparseLinear):
     name = "QuantizedSparseLinear"
-    compression_measure = "parameters"
+    compression_measure = "bits"
     quantized = True 
 
     @torch.no_grad()
@@ -52,6 +52,7 @@ class QuantizedSparseLinear(SparseLinear):
         )
         
         #now quantize the sparse values 
+        self.quant_precision = quant_precision
         self.quant_range = (-2 ** (quant_precision - 1), 2 ** (quant_precision - 1) - 1)
         XQ = self.reconstruct_(method = "super").detach()
 
@@ -136,32 +137,22 @@ class QuantizedSparseLinear(SparseLinear):
         assert self.compressed, "model must be compressed to get n_bits"        
         
         
-        n_bits = (self.quant_n_bits +  2) * torch.sum(self.sparse_mask).item()
+        n_bits = (self.quant_precision +  2) * torch.sum(self.sparse_mask).item()
         #+2 for the positioning bit overhead 
         n_bits = n_bits + self.out_features * self.n_scales_per_row * 16
         return n_bits
         
     def blank_recreate(
         self,
-       pattern = (2, 4),
+        pattern = (2, 4),
         quant_precision: int = 4,
         groupsize: Literal[-1, 128] = 128,
         **kwargs,
     ):
-        raise NotImplementedError("blank_recreate is not implemented for QuantizedSparseLinear, since it is not needed. Use compress instead.")
-        if normalizer is not None:
-            self.normalizer = normalizer
-        else:
-            self.normalizer = normalize.Normalizer.blank_recreate(
-                self.original_weight, **normalizer_kwargs
-            )
-        if isinstance(sparse_group, str) and sparse_group == "d_in":
-            #if sparse_group is "d_in", set it to the input dimension
-            sparse_group = self.in_features
         self.sparse_group, self.n_non_zero_per_group = get_group_and_n_nonzero(
-            frac_nonzero=frac_nonzero,
+            frac_nonzero=0.5,
             pattern=pattern,
-            sparse_group=sparse_group,
+            sparse_group=None,
             d_in=self.in_features,
             d_out=self.out_features,
         )
@@ -171,27 +162,72 @@ class QuantizedSparseLinear(SparseLinear):
         sparse_mask = sparse_mask.view(-1, self.sparse_group)
         sparse_mask[:, self.n_non_zero_per_group:] = False
         sparse_mask = sparse_mask.view(self.original_weight.shape)
-        
         self.sparse_mask = nn.Buffer(
             sparse_mask
         )
+        self.n_scales_per_row = self.in_features // groupsize
         
-        self.X = nn.Parameter(
+        self.XQ = nn.Parameter(
             torch.zeros(
-                self.n_non_zero_per_group * self.get_n_original_parameters()// self.sparse_group,
+                (self.out_features, self.in_features),
                 dtype=self.original_weight.dtype,
                 device=self.original_weight.device,
             ))
+        self.scales = nn.Parameter(
+            torch.zeros(
+                (self.out_features, self.n_scales_per_row, 1),
+                dtype=self.original_weight.dtype,
+                device=self.original_weight.device,
+            )
+        )
+        self.quant_precision = quant_precision
+        self.quant_range = (-2 ** (quant_precision - 1), 2 ** (quant_precision - 1) - 1)
         self.compressed = True
-        # print("self.X.shape", self.X.shape)
-        # print("original weight shape", self.original_weight.shape)
+        
+        
+        # raise NotImplementedError("blank_recreate is not implemented for QuantizedSparseLinear, since it is not needed. Use compress instead.")
+        # if normalizer is not None:
+        #     self.normalizer = normalizer
+        # else:
+        #     self.normalizer = normalize.Normalizer.blank_recreate(
+        #         self.original_weight, **normalizer_kwargs
+        #     )
+        # if isinstance(sparse_group, str) and sparse_group == "d_in":
+        #     #if sparse_group is "d_in", set it to the input dimension
+        #     sparse_group = self.in_features
+        # self.sparse_group, self.n_non_zero_per_group = get_group_and_n_nonzero(
+        #     frac_nonzero=frac_nonzero,
+        #     pattern=pattern,
+        #     sparse_group=sparse_group,
+        #     d_in=self.in_features,
+        #     d_out=self.out_features,
+        # )
+        
+        # sparse_mask = torch.ones(self.original_weight.shape, dtype=torch.bool,
+        #                   device=self.original_weight.device)
+        # sparse_mask = sparse_mask.view(-1, self.sparse_group)
+        # sparse_mask[:, self.n_non_zero_per_group:] = False
+        # sparse_mask = sparse_mask.view(self.original_weight.shape)
+        
+        # self.sparse_mask = nn.Buffer(
+        #     sparse_mask
+        # )
+        
+        # self.X = nn.Parameter(
+        #     torch.zeros(
+        #         self.n_non_zero_per_group * self.get_n_original_parameters()// self.sparse_group,
+        #         dtype=self.original_weight.dtype,
+        #         device=self.original_weight.device,
+        #     ))
+        # self.compressed = True
+        # # print("self.X.shape", self.X.shape)
+        # # print("original weight shape", self.original_weight.shape)
 
 
     def get_n_nonzero(self) -> int:
 
-        recon = self.reconstruct(denormalize=False)
 
-        n_nonzero = torch.sum(recon != 0).item()
+        n_nonzero = self.sparse_mask.numel() - self.sparse_mask.sum().item()
         return n_nonzero
 
 

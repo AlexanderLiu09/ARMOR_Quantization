@@ -403,9 +403,9 @@ class QuantizedARMOR_Linear(CompressedLinear):
         state_dict = torch.load(state_dict_path, map_location=self.original_weight.device)
         self.A.load_state_dict(state_dict["A"])
         self.B.load_state_dict(state_dict["B"])
-        self.naive_compression_module.uncompress_sparse_values()
+        # self.naive_compression_module.uncompress_sparse_values()
         self.naive_compression_module.load_state_dict(state_dict["naive_compression_module"])
-        self.naive_compression_module.compress_sparse_values()
+        # self.naive_compression_module.compress_sparse_values()
         self.compressed = True
         
     def compress(self,
@@ -498,29 +498,13 @@ class QuantizedARMOR_Linear(CompressedLinear):
         # print(kwargs["training_config"])
         training_config = instantiate(kwargs["training_config"])
 
-        if training_config.quant_enabled:
-            print("Loading Quantized Weights")
-            naive_cfg = copy.deepcopy(naive_compression_config)
-            with open_dict(naive_cfg):
-                naive_cfg.init_config._target_ = "src.sparse_compress.QuantizedSparseLinear"
-                naive_cfg.compression_config.quant_n_bits = training_config.quant_n_bits
-                naive_cfg.compression_config.quant_n_grid = training_config.quant_n_grid
-            
-            self.naive_compression_module = utils.blank_init(
-                naive_cfg,
-                n_in = self.original_weight.shape[1],
-                n_out = self.original_weight.shape[0],
-                dtype=self.original_weight.dtype,
-                device=self.original_weight.device,)
-
-        else:
-            print("Loading FP16 Weights")
-            self.naive_compression_module = utils.blank_init(
-                naive_compression_config,
-                n_in = self.original_weight.shape[1],
-                n_out = self.original_weight.shape[0],
-                dtype=self.original_weight.dtype,
-                device=self.original_weight.device,)
+        
+        self.naive_compression_module = utils.blank_init(
+            naive_compression_config,
+            n_in = self.original_weight.shape[1],
+            n_out = self.original_weight.shape[0],
+            dtype=self.original_weight.dtype,
+            device=self.original_weight.device,)
 
         if isinstance(block_diagonal_config.block_size, int):
             block_diagonal_config.block_size = (block_diagonal_config.block_size, block_diagonal_config.block_size)
@@ -579,7 +563,7 @@ if __name__ == "__main__":
         print("current_directory:", os.getcwd())
         model_name = "Qwen/Qwen3-8B-Base"
         # weight_path = "/data/lliu/NoWAG/models/meta-llama/Llama-2-7b-hf/original_weights/layer_28/mlp.up_proj.pt"
-        proj_name = "layer_1/mlp.down_proj"
+        proj_name = "layer_1/self_attn.q_proj"
         weight_path = f"../../../../LLM_data/{model_name}/original_weights/{proj_name}.pt"
         hessian_diag = weight_path.replace("original_weights", "hessian_diag/SlimPajama-627B/n_samples_128_ctx_len_8192/seed_0")
 
@@ -658,7 +642,7 @@ if __name__ == "__main__":
         
         new_compression_module.blank_recreate(
             **cfg.compression_config)
-        
+        print("state dict keys:", state_dict.keys())
         new_compression_module.load_state_dict(state_dict)
         
         assert torch.allclose(
