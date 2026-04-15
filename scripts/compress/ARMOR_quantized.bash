@@ -15,7 +15,6 @@ declare n_iters=5000 #default number of iterations
 declare additional_args=""
 declare quant_n_bits=4 #INT precision for the quantized sparse core
 declare groupsize=128 #quantization groupsize (must divide d_in and be a multiple of sparse group)
-declare n_sparse_core_updates_per_iter=0 #discrete (mask, q) sweeps per iter; 0 = STE-only
 declare sparse_core_step_select="gradient_all_random" #group selection strategy
 
 #loop through the args
@@ -53,7 +52,6 @@ cmd="CUDA_VISIBLE_DEVICES=${gpus} python -u ParallelCompress.py \
     compress.compression_config.naive_compression_config.compression_config.quant_precision=$quant_n_bits \
     compress.compression_config.naive_compression_config.compression_config.groupsize=$groupsize \
     compress.compression_config.training_config.n_iters=$n_iters \
-    compress.compression_config.training_config.n_sparse_core_updates_per_iter=$n_sparse_core_updates_per_iter \
     compress.compression_config.training_config.sparse_core_step_select=$sparse_core_step_select \
      \"datasets=${dataset_config}\""
 
