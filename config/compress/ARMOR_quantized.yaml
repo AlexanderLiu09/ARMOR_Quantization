@@ -10,6 +10,6 @@ compression_config:
   block_diagonal_config:
       block_size: 16
   training_config:
-    log_freq: 1
+    log_freq: 50
     # n_sparse_core_updates_per_iter: 1
     sparse_core_step_select: "gradient_all_Linf_random"

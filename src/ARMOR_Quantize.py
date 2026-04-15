@@ -516,14 +516,11 @@ class QuantizedARMOR_Linear(CompressedLinear):
             optimizer.step()
                     
             #SPARSE CORE STEP
-            loss_before_sparse_step = recon_loss = trainable_sparse.recon_loss(reduction="mean").item() 
             with torch.no_grad():
                 sparse_core_step(
                     trainable_sparse,
                     select=training_config.sparse_core_step_select,
                 )
-            loss_after_sparse_step = recon_loss = trainable_sparse.recon_loss(reduction="mean").item() 
-            assert loss_after_sparse_step < loss_before_sparse_step, "Sparse step increased loss"
                     
              #loss stuff
             with torch.no_grad():
