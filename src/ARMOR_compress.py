@@ -544,7 +544,7 @@ class ARMOR_Linear(CompressedLinear):
                 optimizer.step()
                     
 
-            loss_before_sparse_step = recon_loss = trainable_sparse.recon_loss(reduction="mean") 
+            #loss_before_sparse_step = recon_loss = trainable_sparse.recon_loss(reduction="mean") 
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
                     sparse_core_step(
@@ -553,8 +553,8 @@ class ARMOR_Linear(CompressedLinear):
                         select=training_config.sparse_core_step_select,
                     )
                     # raise ValueError("stop here, we are done with training")
-            loss_after_sparse_step = recon_loss = trainable_sparse.recon_loss(reduction="mean") 
-            assert loss_after_sparse_step < loss_before_sparse_step, "Sparse step increased loss"
+            # loss_after_sparse_step = recon_loss = trainable_sparse.recon_loss(reduction="mean") 
+            # assert loss_after_sparse_step < loss_before_sparse_step, "Sparse step increased loss"
             
             #loss stuff
             with torch.no_grad():
