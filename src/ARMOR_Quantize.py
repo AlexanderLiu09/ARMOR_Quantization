@@ -134,7 +134,6 @@ class BlockCompressLearnable(nn.Module):
 
 @torch.no_grad()
 def sparse_core_step(trainable_sparse: BlockCompressLearnable,
-                     n_times: int = 1,
                      select: Literal["random", "gradient_greedy", "gradient_random"] = "random",
                      ) -> None:
     """Joint (mask, integer-quant) discrete update of the quantized sparse core.
@@ -215,159 +214,159 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
     selection_config = SelectionConfig.from_name(select)
     col_range = torch.arange(group_size, device=device)
 
-    for _ in range(n_times):
-        idxs = torch.arange(n_blocks_total, device=device)
-        j = idxs // n_blocks_1  # block index along dim 0 (row-blocks)
-        k = idxs % n_blocks_1   # block index along dim 1 (col-blocks)
+    
+    idxs = torch.arange(n_blocks_total, device=device)
+    j = idxs // n_blocks_1  # block index along dim 0 (row-blocks)
+    k = idxs % n_blocks_1   # block index along dim 1 (col-blocks)
 
-        # ---- group selection: one sparse group per block ----
-        if selection_config.random:
-            raise NotImplementedError("Random selection not implemented for quantized sparse core step.")
-        if selection_config.masked:
-            raise NotImplementedError("Gradient masked selection not implemented for quantized sparse core step.")
+    # ---- group selection: one sparse group per block ----
+    if selection_config.random:
+        raise NotImplementedError("Random selection not implemented for quantized sparse core step.")
+    if selection_config.masked:
+        raise NotImplementedError("Gradient masked selection not implemented for quantized sparse core step.")
 
-        with torch.enable_grad():
-            S_detached = naive.reconstruct_().detach().clone()
-            S_detached.requires_grad = True
-            loss = trainable_sparse.recon_loss(
-                reduction="mean",
-                recon_weight=trainable_sparse.A @ S_detached @ trainable_sparse.B,
-            )
-            loss.backward()
-            grad = S_detached.grad  # (d_out, d_in)
-
-        grad_blocked = (
-            grad.view(n_blocks_0, block_size_0, n_blocks_1, block_size_1)
-                .transpose(1, 2)
-                .reshape(n_blocks_total, block_size_0 * n_groups_per_block_row, group_size)
+    with torch.enable_grad():
+        S_detached = naive.reconstruct_().detach().clone()
+        S_detached.requires_grad = True
+        loss = trainable_sparse.recon_loss(
+            reduction="mean",
+            recon_weight=trainable_sparse.A @ S_detached @ trainable_sparse.B,
         )
-        if selection_config.norm == "L2":
-            grad_norm = torch.norm(grad_blocked, p=2, dim=-1)
-        elif selection_config.norm == "Linf":
-            grad_norm = torch.norm(grad_blocked, p=float("inf"), dim=-1)
-        elif selection_config.norm == "L1":
-            grad_norm = torch.norm(grad_blocked, p=1, dim=-1)
-        else:
-            raise ValueError(f"Unsupported selection norm: {selection_config.norm}")
+        loss.backward()
+        grad = S_detached.grad  # (d_out, d_in)
 
-        if selection_config.greedy:
-            _, selected_idxs = torch.max(grad_norm, dim=-1)
-        else:
-            selected_idxs = torch.multinomial(grad_norm, num_samples=1).squeeze(-1)
+    grad_blocked = (
+        grad.view(n_blocks_0, block_size_0, n_blocks_1, block_size_1)
+            .transpose(1, 2)
+            .reshape(n_blocks_total, block_size_0 * n_groups_per_block_row, group_size)
+    )
+    if selection_config.norm == "L2":
+        grad_norm = torch.norm(grad_blocked, p=2, dim=-1)
+    elif selection_config.norm == "Linf":
+        grad_norm = torch.norm(grad_blocked, p=float("inf"), dim=-1)
+    elif selection_config.norm == "L1":
+        grad_norm = torch.norm(grad_blocked, p=1, dim=-1)
+    else:
+        raise ValueError(f"Unsupported selection norm: {selection_config.norm}")
 
-        idx_0 = j * block_size_0 + selected_idxs // n_groups_per_block_row
-        idx_1 = k * block_size_1 + (selected_idxs % n_groups_per_block_row) * group_size
-        group_idxs = torch.stack([idx_0, idx_1], dim=1)  # (n_blocks_total, 2)
+    if selection_config.greedy:
+        _, selected_idxs = torch.max(grad_norm, dim=-1)
+    else:
+        selected_idxs = torch.multinomial(grad_norm, num_samples=1).squeeze(-1)
 
-        # ---- residual from zeroing out the selected groups ----
-        original_naive = naive.reconstruct_().clone()
-        original_naive[group_idxs[:, 0].unsqueeze(1),
-                       group_idxs[:, 1].unsqueeze(1) + col_range.unsqueeze(0)] = 0.0
+    idx_0 = j * block_size_0 + selected_idxs // n_groups_per_block_row
+    idx_1 = k * block_size_1 + (selected_idxs % n_groups_per_block_row) * group_size
+    group_idxs = torch.stack([idx_0, idx_1], dim=1)  # (n_blocks_total, 2)
 
-        W_remaining = trainable_sparse.A @ original_naive @ trainable_sparse.B - trainable_sparse.original_weight
-        if trainable_sparse.importance_weight is not None:
-            W_remaining = W_remaining * torch.sqrt(trainable_sparse.importance_weight.unsqueeze(0))
-        W_remaining = (
-            W_remaining.view(n_blocks_0, block_size_0, n_blocks_1, block_size_1)
-                       .transpose(1, 2)
-                       .reshape(n_blocks_total, block_size_0, block_size_1)
-        )
+    # ---- residual from zeroing out the selected groups ----
+    original_naive = naive.reconstruct_().clone()
+    original_naive[group_idxs[:, 0].unsqueeze(1),
+                    group_idxs[:, 1].unsqueeze(1) + col_range.unsqueeze(0)] = 0.0
 
-        # ---- per-block a, B, H, g ----
-        a = A_diag[j, :, idx_0 % block_size_0]  # (n_blocks_total, block_size_0)
+    W_remaining = trainable_sparse.A @ original_naive @ trainable_sparse.B - trainable_sparse.original_weight
+    if trainable_sparse.importance_weight is not None:
+        W_remaining = W_remaining * torch.sqrt(trainable_sparse.importance_weight.unsqueeze(0))
+    W_remaining = (
+        W_remaining.view(n_blocks_0, block_size_0, n_blocks_1, block_size_1)
+                    .transpose(1, 2)
+                    .reshape(n_blocks_total, block_size_0, block_size_1)
+    )
 
-        B = B_diag[k.unsqueeze(1),
-                   (group_idxs[:, 1] % block_size_1).unsqueeze(1) + col_range.unsqueeze(0),
-                   :]  # (n_blocks_total, group_size, block_size_1)
+    # ---- per-block a, B, H, g ----
+    a = A_diag[j, :, idx_0 % block_size_0]  # (n_blocks_total, block_size_0)
 
-        # first-order term g = 2 * B @ W_rem^T @ a, shape (n_blocks_total, group_size)
-        first_order_term = 2.0 * torch.bmm(
-            torch.bmm(B, W_remaining.transpose(1, 2)),
-            a.unsqueeze(2),
-        ).squeeze(2)
+    B = B_diag[k.unsqueeze(1),
+                (group_idxs[:, 1] % block_size_1).unsqueeze(1) + col_range.unsqueeze(0),
+                :]  # (n_blocks_total, group_size, block_size_1)
 
-        # ---- per-pattern H_p = B_p B_p^T and its inverse ----
-        B_selected = B[:, possible_non_zero_idxs, :]  # (b, n_possible, n_nonzero, block_size_1)
-        B_sq = torch.bmm(
-            B_selected.reshape(-1, n_nonzero, block_size_1),
-            B_selected.reshape(-1, n_nonzero, block_size_1).transpose(1, 2),
-        ).view(n_blocks_total, n_possible, n_nonzero, n_nonzero)
-        # Damped inverse via Cholesky (same as non-quantized ARMOR_compress.py)
-        eye = torch.eye(n_nonzero, device=device, dtype=dtype).view(1, 1, n_nonzero, n_nonzero)
-        B_sq_inv = torch.cholesky_inverse(
-            torch.linalg.cholesky_ex(B_sq + eye * 1e-9)[0].reshape(-1, n_nonzero, n_nonzero)
-        ).view(n_blocks_total, n_possible, n_nonzero, n_nonzero)
+    # first-order term g = 2 * B @ W_rem^T @ a, shape (n_blocks_total, group_size)
+    first_order_term = 2.0 * torch.bmm(
+        torch.bmm(B, W_remaining.transpose(1, 2)),
+        a.unsqueeze(2),
+    ).squeeze(2)
 
-        g_all = first_order_term[:, possible_non_zero_idxs]  # (b, n_possible, n_nonzero)
-        a_sq = (a ** 2).sum(dim=1)  # (n_blocks_total,)
+    # ---- per-pattern H_p = B_p B_p^T and its inverse ----
+    B_selected = B[:, possible_non_zero_idxs, :]  # (b, n_possible, n_nonzero, block_size_1)
+    B_sq = torch.bmm(
+        B_selected.reshape(-1, n_nonzero, block_size_1),
+        B_selected.reshape(-1, n_nonzero, block_size_1).transpose(1, 2),
+    ).view(n_blocks_total, n_possible, n_nonzero, n_nonzero)
+    # Damped inverse via Cholesky (same as non-quantized ARMOR_compress.py)
+    eye = torch.eye(n_nonzero, device=device, dtype=dtype).view(1, 1, n_nonzero, n_nonzero)
+    B_sq_inv = torch.cholesky_inverse(
+        torch.linalg.cholesky_ex(B_sq + eye * 1e-9)[0].reshape(-1, n_nonzero, n_nonzero)
+    ).view(n_blocks_total, n_possible, n_nonzero, n_nonzero)
 
-        # ---- continuous LS optimum per pattern: wm*_p = -(H_p^{-1} @ (g_p/2)) / ||a||^2 ----
-        rhs = (g_all / 2.0).unsqueeze(-1)  # (b, n_possible, n_nonzero, 1)
-        wm_star = -torch.bmm(
-            B_sq_inv.reshape(-1, n_nonzero, n_nonzero),
-            rhs.reshape(-1, n_nonzero, 1),
-        ).view(n_blocks_total, n_possible, n_nonzero) / (
-            a_sq.view(-1, 1, 1) + trainable_sparse.eps
-        )  # (b, n_possible, n_nonzero)
+    g_all = first_order_term[:, possible_non_zero_idxs]  # (b, n_possible, n_nonzero)
+    a_sq = (a ** 2).sum(dim=1)  # (n_blocks_total,)
 
-        # ---- per-block scales ----
-        scale_idx = idx_1 // groupsize  # (n_blocks_total,)
-        scales_for_blocks = naive.scales[idx_0, scale_idx, 0]  # (n_blocks_total,)
-        # print(f"groupize: {groupsize}, scale_idx numel: {scale_idx.numel()}, scale shape: {naive.scales.shape}")
-        scale = scales_for_blocks.view(-1, 1, 1)  # (b, 1, 1) for broadcasting
+    # ---- continuous LS optimum per pattern: wm*_p = -(H_p^{-1} @ (g_p/2)) / ||a||^2 ----
+    rhs = (g_all / 2.0).unsqueeze(-1)  # (b, n_possible, n_nonzero, 1)
+    wm_star = -torch.bmm(
+        B_sq_inv.reshape(-1, n_nonzero, n_nonzero),
+        rhs.reshape(-1, n_nonzero, 1),
+    ).view(n_blocks_total, n_possible, n_nonzero) / (
+        a_sq.view(-1, 1, 1) + trainable_sparse.eps
+    )  # (b, n_possible, n_nonzero)
 
-        # ---- build floor/ceil candidates: 2^n_nonzero combos per pattern ----
-        # q_lo/q_hi: integer codes bracketing the continuous optimum, clamped to quant range
-        wm_over_s = wm_star / scale                               # (b, n_possible, n_nonzero)
-        q_lo = torch.floor(wm_over_s).clamp(q_min, q_max)        # (b, n_possible, n_nonzero)
-        q_hi = torch.ceil(wm_over_s).clamp(q_min, q_max)         # (b, n_possible, n_nonzero)
+    # ---- per-block scales ----
+    scale_idx = idx_1 // groupsize  # (n_blocks_total,)
+    scales_for_blocks = naive.scales[idx_0, scale_idx, 0]  # (n_blocks_total,)
+    # print(f"groupize: {groupsize}, scale_idx numel: {scale_idx.numel()}, scale shape: {naive.scales.shape}")
+    scale = scales_for_blocks.view(-1, 1, 1)  # (b, 1, 1) for broadcasting
 
-        # q_combos[b, p, c, i]: integer code for entry i, combo c, pattern p, block b
-        # = q_lo[b,p,i] + combo_flags[c,i] * (q_hi[b,p,i] - q_lo[b,p,i])
-        q_delta = (q_hi - q_lo).unsqueeze(-2)  # (b, n_possible, 1, n_nonzero)
-        q_combos = q_lo.unsqueeze(-2) + combo_flags.view(1, 1, n_combos, n_nonzero) * q_delta
-        # shape (b, n_possible, n_combos, n_nonzero) = (b, 6, 4, 2) for 2:4 INT4
+    # ---- build floor/ceil candidates: 2^n_nonzero combos per pattern ----
+    # q_lo/q_hi: integer codes bracketing the continuous optimum, clamped to quant range
+    wm_over_s = wm_star / scale                               # (b, n_possible, n_nonzero)
+    q_lo = torch.floor(wm_over_s).clamp(q_min, q_max)        # (b, n_possible, n_nonzero)
+    q_hi = torch.ceil(wm_over_s).clamp(q_min, q_max)         # (b, n_possible, n_nonzero)
 
-        # ---- evaluate cost(p, combo) = c0 * q^T H_p q + c1 * g_p^T q ----
-        # c0 = a_sq * scale^2,  c1 = scale  (since s = q * scale)
-        c0 = (a_sq * scales_for_blocks ** 2).view(-1, 1, 1)  # (b, 1, 1, 1)
-        c1 = scales_for_blocks.view(-1, 1, 1)                # (b, 1, 1, 1)
-        # H_p @ q_combo: einsum over last dim j of B_sq and q_combos
-        Hq  = torch.einsum('bpij,bpcj->bpci', B_sq, q_combos)  # (b, 6, 4, 2)
-        qHq = (q_combos * Hq).sum(dim=-1)                       # (b, 6, 4)
-        gq  = (g_all.unsqueeze(-2) * q_combos).sum(dim=-1)      # (b, 6, 4)
-        # print(f"gq shape: {gq.shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
-        # print(f"qHq shape: {qHq.shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
-        # print(f"c0 shape: {c0.shape}, expected (n_blocks_total, 1, 1, 1) = ({n_blocks_total}, 1, 1, 1)")
-        # print(f"c1 shape: {c1.shape}, expected (n_blocks_total, 1, 1, 1) = ({n_blocks_total}, 1, 1, 1)")
-        # print(f"first multiplication shape: {(c0 * qHq).shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
-        # print(f"second multiplication shape: {(c1 * gq).shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
-        cost = c0 * qHq + c1 * gq                               # (b, 6, 4)
+    # q_combos[b, p, c, i]: integer code for entry i, combo c, pattern p, block b
+    # = q_lo[b,p,i] + combo_flags[c,i] * (q_hi[b,p,i] - q_lo[b,p,i])
+    q_delta = (q_hi - q_lo).unsqueeze(-2)  # (b, n_possible, 1, n_nonzero)
+    q_combos = q_lo.unsqueeze(-2) + combo_flags.view(1, 1, n_combos, n_nonzero) * q_delta
+    # shape (b, n_possible, n_combos, n_nonzero) = (b, 6, 4, 2) for 2:4 INT4
 
-        # ---- argmin over 6 * 4 = 24 candidates ----
-        # print(f"cost shape: {cost.shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
-        cost_flat = cost.reshape(n_blocks_total, n_possible * n_combos)  # (b, 24) #NOTE: this line is causing an error
-        best_flat_idx = cost_flat.argmin(dim=1)                           # (b,)
-        optimal_pattern_idx = best_flat_idx // n_combos                   # (b,) in [0, 6)
-        optimal_combo_idx   = best_flat_idx %  n_combos                   # (b,) in [0, 4)
+    # ---- evaluate cost(p, combo) = c0 * q^T H_p q + c1 * g_p^T q ----
+    # c0 = a_sq * scale^2,  c1 = scale  (since s = q * scale)
+    c0 = (a_sq * scales_for_blocks ** 2).view(-1, 1, 1)  # (b, 1, 1, 1)
+    c1 = scales_for_blocks.view(-1, 1, 1)                # (b, 1, 1, 1)
+    # H_p @ q_combo: einsum over last dim j of B_sq and q_combos
+    Hq  = torch.einsum('bpij,bpcj->bpci', B_sq, q_combos)  # (b, 6, 4, 2)
+    qHq = (q_combos * Hq).sum(dim=-1)                       # (b, 6, 4)
+    gq  = (g_all.unsqueeze(-2) * q_combos).sum(dim=-1)      # (b, 6, 4)
+    # print(f"gq shape: {gq.shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
+    # print(f"qHq shape: {qHq.shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
+    # print(f"c0 shape: {c0.shape}, expected (n_blocks_total, 1, 1, 1) = ({n_blocks_total}, 1, 1, 1)")
+    # print(f"c1 shape: {c1.shape}, expected (n_blocks_total, 1, 1, 1) = ({n_blocks_total}, 1, 1, 1)")
+    # print(f"first multiplication shape: {(c0 * qHq).shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
+    # print(f"second multiplication shape: {(c1 * gq).shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
+    cost = c0 * qHq + c1 * gq                               # (b, 6, 4)
 
-        optimal_non_zero_idxs = possible_non_zero_idxs[optimal_pattern_idx]  # (b, n_nonzero)
-        b_idx = torch.arange(n_blocks_total, device=device)
-        optimal_q = q_combos[b_idx, optimal_pattern_idx, optimal_combo_idx]  # (b, n_nonzero)
-        sparse_values = optimal_q * scales_for_blocks.unsqueeze(1)           # (b, n_nonzero)
+    # ---- argmin over 6 * 4 = 24 candidates ----
+    # print(f"cost shape: {cost.shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
+    cost_flat = cost.reshape(n_blocks_total, n_possible * n_combos)  # (b, 24) #NOTE: this line is causing an error
+    best_flat_idx = cost_flat.argmin(dim=1)                           # (b,)
+    optimal_pattern_idx = best_flat_idx // n_combos                   # (b,) in [0, 6)
+    optimal_combo_idx   = best_flat_idx %  n_combos                   # (b,) in [0, 4)
 
-        # ---- write updated mask (clear the 4-group, set the chosen nonzeros) ----
-        naive.sparse_mask[group_idxs[:, 0].unsqueeze(1),
-                          group_idxs[:, 1].unsqueeze(1) + col_range.unsqueeze(0)] = False
-        naive.sparse_mask[group_idxs[:, 0].unsqueeze(1),
-                          optimal_non_zero_idxs + group_idxs[:, 1].unsqueeze(1)] = True
-        naive.check_mask()
+    optimal_non_zero_idxs = possible_non_zero_idxs[optimal_pattern_idx]  # (b, n_nonzero)
+    b_idx = torch.arange(n_blocks_total, device=device)
+    optimal_q = q_combos[b_idx, optimal_pattern_idx, optimal_combo_idx]  # (b, n_nonzero)
+    sparse_values = optimal_q * scales_for_blocks.unsqueeze(1)           # (b, n_nonzero)
 
-        # ---- write XQ (fake-quantized storage = q * scale; STE forward stays on-grid) ----
-        naive.XQ.data[group_idxs[:, 0].unsqueeze(1),
-                      group_idxs[:, 1].unsqueeze(1) + col_range.unsqueeze(0)] = 0.0
-        naive.XQ.data[group_idxs[:, 0].unsqueeze(1),
-                      optimal_non_zero_idxs + group_idxs[:, 1].unsqueeze(1)] = sparse_values
+    # ---- write updated mask (clear the 4-group, set the chosen nonzeros) ----
+    naive.sparse_mask[group_idxs[:, 0].unsqueeze(1),
+                        group_idxs[:, 1].unsqueeze(1) + col_range.unsqueeze(0)] = False
+    naive.sparse_mask[group_idxs[:, 0].unsqueeze(1),
+                        optimal_non_zero_idxs + group_idxs[:, 1].unsqueeze(1)] = True
+    naive.check_mask()
+
+    # ---- write XQ (fake-quantized storage = q * scale; STE forward stays on-grid) ----
+    naive.XQ.data[group_idxs[:, 0].unsqueeze(1),
+                    group_idxs[:, 1].unsqueeze(1) + col_range.unsqueeze(0)] = 0.0
+    naive.XQ.data[group_idxs[:, 0].unsqueeze(1),
+                    optimal_non_zero_idxs + group_idxs[:, 1].unsqueeze(1)] = sparse_values
                 
         
         
@@ -505,28 +504,25 @@ class QuantizedARMOR_Linear(CompressedLinear):
         remaining_patience = training_config.overall_patience
         for i in tqdm.tqdm(range(training_config.n_iters), disable = not self.verbose):
             
-            #optimizer step
-            for j in tqdm.tqdm(range(training_config.n_continous_updates_per_iter),  disable = (not self.verbose or training_config.n_continous_updates_per_iter<10)):
-                
-                #reset the optimizers
-                optimizer.zero_grad()   
-                
-                recon_loss = trainable_sparse.recon_loss(reduction="mean") 
-                loss = recon_loss
-             
-                loss.backward()
-                #step the optimizers
-                optimizer.step()
+            #CONTINOUS STEP
+            #reset the optimizers
+            optimizer.zero_grad()   
+            
+            recon_loss = trainable_sparse.recon_loss(reduction="mean") 
+            loss = recon_loss
+            
+            loss.backward()
+            #step the optimizers
+            optimizer.step()
                     
-
+            #SPARSE CORE STEP
             if training_config.n_sparse_core_updates_per_iter != 0:
                 with torch.no_grad():
                     sparse_core_step(
                         trainable_sparse,
-                        n_times=training_config.n_sparse_core_updates_per_iter,
                         select=training_config.sparse_core_step_select,
                     )
-                    # raise ValueError("stop here, we are done with training")
+                    
              #loss stuff
             with torch.no_grad():
                 current_loss = trainable_sparse.recon_loss(reduction="mean").item()

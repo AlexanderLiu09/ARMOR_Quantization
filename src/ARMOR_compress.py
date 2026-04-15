@@ -403,8 +403,8 @@ class TrainingConfig:
 
     """
     n_iters: int = 100
-    n_continous_updates_per_iter: int = 1
-    n_sparse_core_updates_per_iter: int = 0
+    # n_continous_updates_per_iter: int = 1
+    # n_sparse_core_updates_per_iter: int = 0
     sparse_core_step_select: str = "random"
     overall_patience: int = 10
     loss_atol: float = 1e-8

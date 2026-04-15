@@ -15,14 +15,14 @@ compression_config:
 
   optimizer_config:
     _target_: "torch.optim.Adam"
-    lr: 1e-4
+    lr: 1e-3
     # weight_decay: 0.001
 
   training_config:
     _target_: "src.ARMOR_compress.TrainingConfig"
     n_iters: 3000
-    n_continous_updates_per_iter: 1
-    n_sparse_core_updates_per_iter: 1
+    # n_continous_updates_per_iter: 1
+    # n_sparse_core_updates_per_iter: 1
     sparse_core_step_select: "gradient_all_random"
     loss_atol: 1e-8
     loss_rtol: 1e-6
