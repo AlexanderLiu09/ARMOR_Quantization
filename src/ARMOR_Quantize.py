@@ -370,16 +370,21 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
                 
         
         
+def loss_wrapper(trainable_sparse: BlockCompressLearnable):
+    """
+    for torch.compile()
+    """        
         
-        
-        
-        
-        
-        
+    S =  trainable_sparse.naive_compression_module.reconstruct_(method="straight_through")
+    residual = trainable_sparse.original_weight - trainable_sparse.A @ S @ trainable_sparse.B
 
+    if trainable_sparse.importance_weight is not None:
+        residual = residual * torch.sqrt(trainable_sparse.importance_weight.unsqueeze(0))
+    
+    return (residual * residual).mean() / trainable_sparse.loss_scaling["mean"]
 
         
-
+compiled_loss = torch.compile(loss_wrapper, mode="default", dynamic=False)       
 
 
 def initialize_optimizer(
@@ -490,7 +495,7 @@ class QuantizedARMOR_Linear(CompressedLinear):
         with torch.no_grad():
             # trainable_sparse()
             pre_quant_loss = trainable_sparse.recon_loss(reduction="mean", recon_weight = original_sparse).item()
-            prev_iter_loss = trainable_sparse.recon_loss(reduction="mean").item()
+            prev_iter_loss = compiled_loss(trainable_sparse).item() #trainable_sparse.recon_loss(reduction="mean").item()
             if self.verbose:
                 print("Pre-quantization loss (using original sparse reconstruction):", pre_quant_loss)
                 print(f"Initial loss: {prev_iter_loss}")
@@ -500,7 +505,11 @@ class QuantizedARMOR_Linear(CompressedLinear):
                 self.wandb_queue.put({self.metric_name: prev_iter_loss,
                            self.step_metric: 1})
             # best_state_dict = copy.deepcopy(trainable_sparse.state_dict())
-            
+
+        #warmpup    
+        with torch.no_grad():
+            _ = compiled_loss(trainable_sparse)
+
         remaining_patience = training_config.overall_patience
         for i in tqdm.tqdm(range(training_config.n_iters), disable = not self.verbose):
             
@@ -508,7 +517,7 @@ class QuantizedARMOR_Linear(CompressedLinear):
             #reset the optimizers
             optimizer.zero_grad()   
             
-            recon_loss = trainable_sparse.recon_loss(reduction="mean") 
+            recon_loss = compiled_loss(trainable_sparse) #trainable_sparse.recon_loss(reduction="mean") 
             loss = recon_loss
             
             loss.backward()
@@ -524,7 +533,7 @@ class QuantizedARMOR_Linear(CompressedLinear):
                     
              #loss stuff
             with torch.no_grad():
-                current_loss = trainable_sparse.recon_loss(reduction="mean").item()
+                current_loss = compiled_loss(trainable_sparse).item() #trainable_sparse.recon_loss(reduction="mean").item()
                 if current_loss > (1 - training_config.loss_rtol) * prev_iter_loss or current_loss > prev_iter_loss - training_config.loss_atol:
                     remaining_patience -= 1
 
