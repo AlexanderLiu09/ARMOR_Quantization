@@ -54,7 +54,7 @@ class SparseLinear(compression_parent.CompressedLinear):
     @torch.no_grad()
     def sparsify(
         self,
-        frac_nonzero: float = 0.1,
+        frac_nonzero: float = 0.5,
         pattern: Optional[Tuple[int, int]] = None,
         sparse_group: Optional[Union[int, Literal["d_in"]]] = None,
         normalizer_kwargs: Optional[dict] = None,

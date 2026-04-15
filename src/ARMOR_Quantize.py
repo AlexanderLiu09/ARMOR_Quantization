@@ -28,7 +28,7 @@ from src.quantize_sparse import QuantizedSparseLinear
 from src.utils import normalizer as normalize
 from src.utils import utils
 from src.utils.blockwise_diag_matricies import BlockwiseDiagMatrix
-from src.ARMOR_compress import initalize_optimizer, TrainingConfig
+from src.ARMOR_compress import initalize_optimizer, TrainingConfig, SelectionConfig
 from src.utils.quantize import fake_quantize_per_row, find_optimal_scale_per_row, QuantConfig, STEQuantizePerRow
     
 class BlockCompressLearnable(nn.Module):
@@ -129,36 +129,6 @@ class BlockCompressLearnable(nn.Module):
             return recon_loss_elementwise
 
 
-@dataclass
-class SelectionConfig:
-    random: bool = False #random or gradient based
-    masked: bool = False #whether to only select from the masked elements
-    norm: Literal["L1, L2", "Linf"] = "L1" #the norm to use for the gradient based selection
-    greedy: bool = True #whether to use greedy or random selection for the gradient based selection
-    
-    @classmethod
-    def from_name(cls, name: str):
-        #if the name is just random
-        if name == "random":
-            return cls(random=True, masked=False)
-        prefix,name = name.split("_",1)
-        assert prefix=="gradient", f"Unknown selection method {name}, expected 'random' or 'gradient_*'."
-        
-        terms = name.split("_")
-        defaults = {"masked": False, "norm": "L1", "greedy": False}
-        for term in terms:
-            if term == "masked":
-                defaults["masked"] = True
-            if term == "all":
-                defaults["masked"] = False
-            elif term in ["L1", "L2", "Linf"]:
-                defaults["norm"] = term
-            elif term in ["greedy", "random"]:
-                defaults["greedy"] = term == "greedy"
-            else:
-                raise ValueError(f"Unknown selection method {name}, expected 'random' or 'gradient_*_masked_*_{'L1'|'L2'|'Linf'}'.")
-        
-        return cls(random=False, **defaults)
     
 
 
@@ -191,6 +161,11 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
     n_blocks_0 = d_out // block_size_0
     n_blocks_1 = d_in // block_size_1
     n_blocks_total = n_blocks_0 * n_blocks_1
+    
+    # print("Shapes")
+    # print(f"d_out: {d_out}, d_in: {d_in}")
+    # print(f"n_blocks_total: {n_blocks_total}, n_blocks_0: {n_blocks_0}, n_blocks_1: {n_blocks_1}")
+    
 
     group_size = naive.sparse_group           # 4 for 2:4
     n_nonzero = naive.n_non_zero_per_group    # 2 for 2:4
@@ -338,6 +313,7 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
         # ---- per-block scales ----
         scale_idx = idx_1 // groupsize  # (n_blocks_total,)
         scales_for_blocks = naive.scales[idx_0, scale_idx, 0]  # (n_blocks_total,)
+        # print(f"groupize: {groupsize}, scale_idx numel: {scale_idx.numel()}, scale shape: {naive.scales.shape}")
         scale = scales_for_blocks.view(-1, 1, 1)  # (b, 1, 1) for broadcasting
 
         # ---- build floor/ceil candidates: 2^n_nonzero combos per pattern ----
@@ -354,16 +330,23 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
 
         # ---- evaluate cost(p, combo) = c0 * q^T H_p q + c1 * g_p^T q ----
         # c0 = a_sq * scale^2,  c1 = scale  (since s = q * scale)
-        c0 = (a_sq * scales_for_blocks ** 2).view(-1, 1, 1, 1)  # (b, 1, 1, 1)
-        c1 = scales_for_blocks.view(-1, 1, 1, 1)                # (b, 1, 1, 1)
+        c0 = (a_sq * scales_for_blocks ** 2).view(-1, 1, 1)  # (b, 1, 1, 1)
+        c1 = scales_for_blocks.view(-1, 1, 1)                # (b, 1, 1, 1)
         # H_p @ q_combo: einsum over last dim j of B_sq and q_combos
         Hq  = torch.einsum('bpij,bpcj->bpci', B_sq, q_combos)  # (b, 6, 4, 2)
         qHq = (q_combos * Hq).sum(dim=-1)                       # (b, 6, 4)
         gq  = (g_all.unsqueeze(-2) * q_combos).sum(dim=-1)      # (b, 6, 4)
+        # print(f"gq shape: {gq.shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
+        # print(f"qHq shape: {qHq.shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
+        # print(f"c0 shape: {c0.shape}, expected (n_blocks_total, 1, 1, 1) = ({n_blocks_total}, 1, 1, 1)")
+        # print(f"c1 shape: {c1.shape}, expected (n_blocks_total, 1, 1, 1) = ({n_blocks_total}, 1, 1, 1)")
+        # print(f"first multiplication shape: {(c0 * qHq).shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
+        # print(f"second multiplication shape: {(c1 * gq).shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
         cost = c0 * qHq + c1 * gq                               # (b, 6, 4)
 
         # ---- argmin over 6 * 4 = 24 candidates ----
-        cost_flat = cost.reshape(n_blocks_total, n_possible * n_combos)  # (b, 24)
+        # print(f"cost shape: {cost.shape}, expected (n_blocks_total, n_possible, n_combos) = ({n_blocks_total}, 6, 4)")
+        cost_flat = cost.reshape(n_blocks_total, n_possible * n_combos)  # (b, 24) #NOTE: this line is causing an error
         best_flat_idx = cost_flat.argmin(dim=1)                           # (b,)
         optimal_pattern_idx = best_flat_idx // n_combos                   # (b,) in [0, 6)
         optimal_combo_idx   = best_flat_idx %  n_combos                   # (b,) in [0, 4)
