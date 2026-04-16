@@ -389,27 +389,26 @@ def loss_wrapper(trainable_sparse: BlockCompressLearnable):
 compiled_loss = torch.compile(loss_wrapper, mode="default", dynamic=False)       
 
 
-def initialize_split_optimizer(
+def initialize_split_optimizers(
     trainable_sparse: BlockCompressLearnable,
-    optimizer_config: DictConfig,
-    type: Literal["scales", "weights"]):
+    weight_optimizer_config: DictConfig,
+    scale_optimizer_config: DictConfig):
 
-    if type == "weights":
-        optimizer = instantiate(
-            optimizer_config, 
-            params=[trainable_sparse.A.diag_blocks, 
-                    trainable_sparse.B.diag_blocks, 
-                    trainable_sparse.naive_compression_module.XQ]
-        )
-    else:
-        optimizer = optimizer = instantiate(
-            optimizer_config, 
-            params=[trainable_sparse.A.scales, 
-                    trainable_sparse.B.scales,
-                    trainable_sparse.naive_compression_module.scales]
-        )
-    
-    return optimizer
+    weight_params = [
+        trainable_sparse.A.diag_blocks,
+        trainable_sparse.B.diag_blocks,
+        trainable_sparse.naive_compression_module.XQ,
+    ]
+    scale_params = [
+        trainable_sparse.A.scales,
+        trainable_sparse.B.scales,
+        trainable_sparse.naive_compression_module.scales,
+    ]
+
+    weight_optimizer = instantiate(weight_optimizer_config, params=weight_params)
+    scale_optimizer = instantiate(scale_optimizer_config, params=scale_params)
+
+    return weight_optimizer, scale_optimizer
 
 def get_divisors(x):
     divisors = []
@@ -428,11 +427,13 @@ class QuantizedARMOR_Linear(CompressedLinear):
         self,
         naive_compression_config: DictConfig,
         block_diagonal_config: DictConfig,
-        optimizer_config: DictConfig,
+        weight_optimizer_config: DictConfig,
+        scale_optimizer_config: DictConfig,
         training_config: DictConfig,
         normalizer: Optional[normalize.Normalizer] = None,
         normalizer_kwargs: Optional[dict] = None,
         training_config_overrides: Optional[dict] = {},
+        optimizer_config: Optional[DictConfig] = None,
     ):
         
         torch.set_num_threads(1)
@@ -475,9 +476,10 @@ class QuantizedARMOR_Linear(CompressedLinear):
             **block_diagonal_config,
         )
         #create the optimizers
-        optimizer = initalize_optimizer(
+        weight_optimizer, scale_optimizer = initialize_split_optimizers(
             trainable_sparse=trainable_sparse,
-            optimizer_config=optimizer_config,
+            weight_optimizer_config=weight_optimizer_config,
+            scale_optimizer_config=scale_optimizer_config,
         )
             
         start_time = time.time()
@@ -505,14 +507,16 @@ class QuantizedARMOR_Linear(CompressedLinear):
             
             #CONTINOUS STEP
             #reset the optimizers
-            optimizer.zero_grad()   
-            
-            recon_loss = compiled_loss(trainable_sparse) #trainable_sparse.recon_loss(reduction="mean") 
+            weight_optimizer.zero_grad()
+            scale_optimizer.zero_grad()
+
+            recon_loss = compiled_loss(trainable_sparse) #trainable_sparse.recon_loss(reduction="mean")
             loss = recon_loss
-            
+
             loss.backward()
             #step the optimizers
-            optimizer.step()
+            weight_optimizer.step()
+            scale_optimizer.step()
                     
             #SPARSE CORE STEP
             with torch.no_grad():
@@ -595,17 +599,20 @@ class QuantizedARMOR_Linear(CompressedLinear):
     def compress(self,
                naive_compression_config: DictConfig,
         block_diagonal_config: DictConfig,
-        optimizer_config: DictConfig,
+        weight_optimizer_config: DictConfig,
+        scale_optimizer_config: DictConfig,
         training_config: DictConfig,
         normalizer: Optional[normalize.Normalizer] = None,
         normalizer_kwargs: Optional[dict] = None,
         training_config_overrides: Optional[dict] = {},
+        optimizer_config: Optional[DictConfig] = None,
     ):
         self.compressed = True
         return self.ARMOR_sparse_(
             naive_compression_config = naive_compression_config,
             block_diagonal_config = block_diagonal_config,
-            optimizer_config = optimizer_config,
+            weight_optimizer_config = weight_optimizer_config,
+            scale_optimizer_config = scale_optimizer_config,
             training_config = training_config,
             normalizer = normalizer,
             normalizer_kwargs = normalizer_kwargs,

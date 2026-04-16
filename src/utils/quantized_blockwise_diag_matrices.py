@@ -11,7 +11,7 @@ class QuantizedBlockwiseDiagMatrix(BlockwiseDiagMatrix):
         self.quant_range = (-2 ** (quant_precision - 1), 2 ** (quant_precision - 1) - 1)
 
         #group_size = self.block_size
-        self.scales = nn.Parameter(self.diag_blocks.abs().amax(dim=-1, keepdim=True) / self.quant_range[1] - 1)
+        self.scales = nn.Parameter(self.diag_blocks.abs().amax(dim=-1, keepdim=True) / (self.quant_range[1] - 1))
         
         #keep self.diag_blocks as float master copy
         #mimic QuantizedSparseLinear
