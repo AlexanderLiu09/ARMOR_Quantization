@@ -29,13 +29,12 @@ from src.utils import normalizer as normalize
 from src.utils import utils
 from src.utils.blockwise_diag_matricies import BlockwiseDiagMatrix
 from src.ARMOR_compress import initalize_optimizer, TrainingConfig, SelectionConfig
-from src.utils.quantize import fake_quantize_per_row, find_optimal_scale_per_row, QuantConfig, STEQuantizePerRow
-    
+from src.utils.quantized_blockwise_diag_matrices import QuantizedBlockwiseDiagMatrix
 class BlockCompressLearnable(nn.Module):
     original_weight: torch.FloatTensor
     importance_weight: Union[None, torch.FloatTensor] #shape of (d_in) if not None
-    A: BlockwiseDiagMatrix #shape of (d_out, d_in)
-    B: BlockwiseDiagMatrix #shape of (d_in, d_out)
+    A: QuantizedBlockwiseDiagMatrix #shape of (d_out, d_in)
+    B: QuantizedBlockwiseDiagMatrix #shape of (d_in, d_out)
     naive_compression_module: QuantizedSparseLinear
     block_size: int
     eps: float = 1e-8
@@ -75,16 +74,19 @@ class BlockCompressLearnable(nn.Module):
             
         self.block_size = block_size
         
+        quant_precision = naive_compression_module.quant_precision
         #initalize each of the permutation matricies
-        self.A = BlockwiseDiagMatrix(
+        self.A = QuantizedBlockwiseDiagMatrix(
             d = d_out,
             block_size=block_size[0],
-            initalize_as_identity=True
+            initalize_as_identity=True,
+            quant_precision=quant_precision
         )
-        self.B = BlockwiseDiagMatrix(
+        self.B = QuantizedBlockwiseDiagMatrix(
             d = d_in,
             block_size=block_size[1],
-            initalize_as_identity=True
+            initalize_as_identity=True,
+            quant_precision=quant_precision
         )
                                                          
             
@@ -187,8 +189,8 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
     dtype = trainable_sparse.A.diag_blocks.dtype
 
     # ---- fold sqrt(H) (importance) into B_diag (no inner normalizer to fold) ----
-    A_diag = trainable_sparse.A.diag_blocks
-    B_diag = trainable_sparse.B.diag_blocks
+    A_diag = trainable_sparse.A.get_dequantized()
+    B_diag = trainable_sparse.B.get_dequantized()
     if trainable_sparse.importance_weight is not None:
         B_diag = B_diag * torch.sqrt(
             trainable_sparse.importance_weight.view(n_blocks_1, 1, block_size_1)
@@ -702,17 +704,21 @@ class QuantizedARMOR_Linear(CompressedLinear):
 
         if isinstance(block_diagonal_config.block_size, int):
             block_diagonal_config.block_size = (block_diagonal_config.block_size, block_diagonal_config.block_size)
-        self.A = BlockwiseDiagMatrix(
+        
+        quant_precision = self.naive_compression_module.quant_precision
+        self.A = QuantizedBlockwiseDiagMatrix(
             d=self.original_weight.shape[0],
             block_size=block_diagonal_config.block_size[0],
             initalize_as_identity=True,
             device=self.original_weight.device,
+            quant_precision=quant_precision
         )
-        self.B = BlockwiseDiagMatrix(
+        self.B = QuantizedBlockwiseDiagMatrix(
             d=self.original_weight.shape[1],
             block_size=block_diagonal_config.block_size[1],
             initalize_as_identity=True,
             device=self.original_weight.device,
+            quant_precision=quant_precision
         )
         
         
