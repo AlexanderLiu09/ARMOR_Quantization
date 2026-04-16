@@ -389,37 +389,25 @@ def loss_wrapper(trainable_sparse: BlockCompressLearnable):
 compiled_loss = torch.compile(loss_wrapper, mode="default", dynamic=False)       
 
 
-def initialize_optimizer(
+def initialize_split_optimizer(
     trainable_sparse: BlockCompressLearnable,
     optimizer_config: DictConfig,
-    type: str):
-    
-    
-    # #create the optimizers
-    # trainable_sparse.A.init_optimizers(optimizer_config)
-    # trainable_sparse.B.init_optimizers(optimizer_config)
-    
-    # params = []
-    # #get all the parameters that are not in trainable_sparse.A and trainable_sparse.B
-    # for name, param in trainable_sparse.named_parameters():
-    #     if name.startswith("A.") or name.startswith("B."):
-    #         continue
-    #     if param.requires_grad:
-    #         params.append(param)
+    type: Literal["scales", "weights"]):
 
-
-    if type == "wrapper":
+    if type == "weights":
         optimizer = instantiate(
             optimizer_config, 
-            params=list(trainable_sparse.A.parameters()) + list(trainable_sparse.B.parameters())
-        )
-    elif type == "core":
-        optimizer = optimizer = instantiate(
-            optimizer_config, 
-            params=trainable_sparse.naive_compression_module.parameters()
+            params=[trainable_sparse.A.diag_blocks, 
+                    trainable_sparse.B.diag_blocks, 
+                    trainable_sparse.naive_compression_module.XQ]
         )
     else:
-        raise ValueError("Incorrect optimizer type")
+        optimizer = optimizer = instantiate(
+            optimizer_config, 
+            params=[trainable_sparse.A.scales, 
+                    trainable_sparse.B.scales,
+                    trainable_sparse.naive_compression_module.scales]
+        )
     
     return optimizer
 
