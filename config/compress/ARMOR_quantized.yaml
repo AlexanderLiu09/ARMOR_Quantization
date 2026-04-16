@@ -9,13 +9,6 @@ init_config:
 compression_config:
   block_diagonal_config:
       block_size: 16
-  optimizer_config: null
-  weight_optimizer_config:
-    _target_: "torch.optim.Adam"
-    lr: 1e-4
-  scale_optimizer_config:
-    _target_: "torch.optim.Adam"
-    lr: 1e-5
   training_config:
     log_freq: 50
     # n_sparse_core_updates_per_iter: 1

@@ -29,12 +29,13 @@ from src.utils import normalizer as normalize
 from src.utils import utils
 from src.utils.blockwise_diag_matricies import BlockwiseDiagMatrix
 from src.ARMOR_compress import initalize_optimizer, TrainingConfig, SelectionConfig
-from src.utils.quantized_blockwise_diag_matrices import QuantizedBlockwiseDiagMatrix
+from src.utils.quantize import fake_quantize_per_row, find_optimal_scale_per_row, QuantConfig, STEQuantizePerRow
+    
 class BlockCompressLearnable(nn.Module):
     original_weight: torch.FloatTensor
     importance_weight: Union[None, torch.FloatTensor] #shape of (d_in) if not None
-    A: QuantizedBlockwiseDiagMatrix #shape of (d_out, d_in)
-    B: QuantizedBlockwiseDiagMatrix #shape of (d_in, d_out)
+    A: BlockwiseDiagMatrix #shape of (d_out, d_in)
+    B: BlockwiseDiagMatrix #shape of (d_in, d_out)
     naive_compression_module: QuantizedSparseLinear
     block_size: int
     eps: float = 1e-8
@@ -74,19 +75,16 @@ class BlockCompressLearnable(nn.Module):
             
         self.block_size = block_size
         
-        quant_precision = naive_compression_module.quant_precision
         #initalize each of the permutation matricies
-        self.A = QuantizedBlockwiseDiagMatrix(
+        self.A = BlockwiseDiagMatrix(
             d = d_out,
             block_size=block_size[0],
-            initalize_as_identity=True,
-            quant_precision=quant_precision
+            initalize_as_identity=True
         )
-        self.B = QuantizedBlockwiseDiagMatrix(
+        self.B = BlockwiseDiagMatrix(
             d = d_in,
             block_size=block_size[1],
-            initalize_as_identity=True,
-            quant_precision=quant_precision
+            initalize_as_identity=True
         )
                                                          
             
@@ -189,8 +187,8 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
     dtype = trainable_sparse.A.diag_blocks.dtype
 
     # ---- fold sqrt(H) (importance) into B_diag (no inner normalizer to fold) ----
-    A_diag = trainable_sparse.A.get_dequantized()
-    B_diag = trainable_sparse.B.get_dequantized()
+    A_diag = trainable_sparse.A.diag_blocks
+    B_diag = trainable_sparse.B.diag_blocks
     if trainable_sparse.importance_weight is not None:
         B_diag = B_diag * torch.sqrt(
             trainable_sparse.importance_weight.view(n_blocks_1, 1, block_size_1)
@@ -389,26 +387,39 @@ def loss_wrapper(trainable_sparse: BlockCompressLearnable):
 compiled_loss = torch.compile(loss_wrapper, mode="default", dynamic=False)       
 
 
-def initialize_split_optimizers(
+def initialize_optimizer(
     trainable_sparse: BlockCompressLearnable,
-    weight_optimizer_config: DictConfig,
-    scale_optimizer_config: DictConfig):
+    optimizer_config: DictConfig,
+    type: str):
+    
+    
+    # #create the optimizers
+    # trainable_sparse.A.init_optimizers(optimizer_config)
+    # trainable_sparse.B.init_optimizers(optimizer_config)
+    
+    # params = []
+    # #get all the parameters that are not in trainable_sparse.A and trainable_sparse.B
+    # for name, param in trainable_sparse.named_parameters():
+    #     if name.startswith("A.") or name.startswith("B."):
+    #         continue
+    #     if param.requires_grad:
+    #         params.append(param)
 
-    weight_params = [
-        trainable_sparse.A.diag_blocks,
-        trainable_sparse.B.diag_blocks,
-        trainable_sparse.naive_compression_module.XQ,
-    ]
-    scale_params = [
-        trainable_sparse.A.scales,
-        trainable_sparse.B.scales,
-        trainable_sparse.naive_compression_module.scales,
-    ]
 
-    weight_optimizer = instantiate(weight_optimizer_config, params=weight_params)
-    scale_optimizer = instantiate(scale_optimizer_config, params=scale_params)
-
-    return weight_optimizer, scale_optimizer
+    if type == "wrapper":
+        optimizer = instantiate(
+            optimizer_config, 
+            params=list(trainable_sparse.A.parameters()) + list(trainable_sparse.B.parameters())
+        )
+    elif type == "core":
+        optimizer = optimizer = instantiate(
+            optimizer_config, 
+            params=trainable_sparse.naive_compression_module.parameters()
+        )
+    else:
+        raise ValueError("Incorrect optimizer type")
+    
+    return optimizer
 
 def get_divisors(x):
     divisors = []
@@ -427,13 +438,11 @@ class QuantizedARMOR_Linear(CompressedLinear):
         self,
         naive_compression_config: DictConfig,
         block_diagonal_config: DictConfig,
-        weight_optimizer_config: DictConfig,
-        scale_optimizer_config: DictConfig,
+        optimizer_config: DictConfig,
         training_config: DictConfig,
         normalizer: Optional[normalize.Normalizer] = None,
         normalizer_kwargs: Optional[dict] = None,
         training_config_overrides: Optional[dict] = {},
-        optimizer_config: Optional[DictConfig] = None,
     ):
         
         torch.set_num_threads(1)
@@ -476,10 +485,9 @@ class QuantizedARMOR_Linear(CompressedLinear):
             **block_diagonal_config,
         )
         #create the optimizers
-        weight_optimizer, scale_optimizer = initialize_split_optimizers(
+        optimizer = initalize_optimizer(
             trainable_sparse=trainable_sparse,
-            weight_optimizer_config=weight_optimizer_config,
-            scale_optimizer_config=scale_optimizer_config,
+            optimizer_config=optimizer_config,
         )
             
         start_time = time.time()
@@ -507,16 +515,14 @@ class QuantizedARMOR_Linear(CompressedLinear):
             
             #CONTINOUS STEP
             #reset the optimizers
-            weight_optimizer.zero_grad()
-            scale_optimizer.zero_grad()
-
-            recon_loss = compiled_loss(trainable_sparse) #trainable_sparse.recon_loss(reduction="mean")
+            optimizer.zero_grad()   
+            
+            recon_loss = compiled_loss(trainable_sparse) #trainable_sparse.recon_loss(reduction="mean") 
             loss = recon_loss
-
+            
             loss.backward()
             #step the optimizers
-            weight_optimizer.step()
-            scale_optimizer.step()
+            optimizer.step()
                     
             #SPARSE CORE STEP
             with torch.no_grad():
@@ -599,20 +605,17 @@ class QuantizedARMOR_Linear(CompressedLinear):
     def compress(self,
                naive_compression_config: DictConfig,
         block_diagonal_config: DictConfig,
-        weight_optimizer_config: DictConfig,
-        scale_optimizer_config: DictConfig,
+        optimizer_config: DictConfig,
         training_config: DictConfig,
         normalizer: Optional[normalize.Normalizer] = None,
         normalizer_kwargs: Optional[dict] = None,
         training_config_overrides: Optional[dict] = {},
-        optimizer_config: Optional[DictConfig] = None,
     ):
         self.compressed = True
         return self.ARMOR_sparse_(
             naive_compression_config = naive_compression_config,
             block_diagonal_config = block_diagonal_config,
-            weight_optimizer_config = weight_optimizer_config,
-            scale_optimizer_config = scale_optimizer_config,
+            optimizer_config = optimizer_config,
             training_config = training_config,
             normalizer = normalizer,
             normalizer_kwargs = normalizer_kwargs,
@@ -699,21 +702,17 @@ class QuantizedARMOR_Linear(CompressedLinear):
 
         if isinstance(block_diagonal_config.block_size, int):
             block_diagonal_config.block_size = (block_diagonal_config.block_size, block_diagonal_config.block_size)
-        
-        quant_precision = self.naive_compression_module.quant_precision
-        self.A = QuantizedBlockwiseDiagMatrix(
+        self.A = BlockwiseDiagMatrix(
             d=self.original_weight.shape[0],
             block_size=block_diagonal_config.block_size[0],
             initalize_as_identity=True,
             device=self.original_weight.device,
-            quant_precision=quant_precision
         )
-        self.B = QuantizedBlockwiseDiagMatrix(
+        self.B = BlockwiseDiagMatrix(
             d=self.original_weight.shape[1],
             block_size=block_diagonal_config.block_size[1],
             initalize_as_identity=True,
             device=self.original_weight.device,
-            quant_precision=quant_precision
         )
         
         

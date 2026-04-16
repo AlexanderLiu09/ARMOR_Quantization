@@ -27,46 +27,37 @@ class BlockwiseDiagMatrix(nn.Module):
         :param leading: If True, treat the blockwise matrix as leading (left multiplication).
         :return: Output tensor after applying the blockwise diagonal matrix. should be of the same shape as x
         """
-        blocks = self.get_dequantized()
         if leading:
             #assumes its (block_matrix) @ x
             #equivalent to calling self.__matmul__(x)
             assert x.shape[-2] == self.d, "Input dimension must match the matrix dimension"
             # Perform blockwise multiplication
        
-            result = torch.einsum('bik,...bkl->...bil', blocks, x.reshape(x.shape[:-2] + (self.num_blocks, self.block_size, x.shape[-1])))
+            result = torch.einsum('bik,...bkl->...bil', self.diag_blocks, x.reshape(x.shape[:-2] + (self.num_blocks, self.block_size, x.shape[-1])))
         else:
             #assumes its x @ (block_matrix)
             #equivalent to calling self.__rmatmul__(x)
             assert x.shape[-1] == self.d, "Input dimension must match the matrix dimension"
             # Perform blockwise multiplication
-            result = torch.einsum('...bi,bij->...bj', x.reshape(-1, self.num_blocks, self.block_size), blocks)
+            result = torch.einsum('...bi,bij->...bj', x.reshape(-1, self.num_blocks, self.block_size), self.diag_blocks)
         return result.reshape_as(x)
         # else:
         #     return self.__rmatmul__(x)
-
-    def get_dequantized(self) -> torch.Tensor:
-        """
-        equivalent to self.diag_blocks, overriden in QuantizedBlockwiseDiagMatrix
-        Returns:
-            torch.Tensor: diagonal blocks
-        """
-        return self.diag_blocks
     
     def __matmul__(self, x: torch.Tensor) -> torch.Tensor:
         assert x.shape[-2] == self.d, "Input dimension must match the matrix dimension"
         # Perform blockwise multiplication
-        result = torch.einsum('bik,...bkl->...bil', self.get_dequantized(), x.reshape(x.shape[:-2] + (self.num_blocks, self.block_size, x.shape[-1])))
+        result = torch.einsum('bik,...bkl->...bil', self.diag_blocks, x.reshape(x.shape[:-2] + (self.num_blocks, self.block_size, x.shape[-1])))
         return result.reshape_as(x)
             
     def __rmatmul__(self, x: torch.Tensor) -> torch.Tensor:
         assert x.shape[-1] == self.d, "Input dimension must match the matrix dimension"
         # Perform blockwise multiplication
-        result = torch.einsum('...bi,bij->...bj', x.reshape(-1, self.num_blocks, self.block_size), self.get_dequantized())
+        result = torch.einsum('...bi,bij->...bj', x.reshape(-1, self.num_blocks, self.block_size), self.diag_blocks)
         return result.reshape_as(x)
     
     def get_dense(self):
-        return torch.block_diag(*[self.get_dequantized()[i] for i in range(self.num_blocks)])
+        return torch.block_diag(*[self.diag_blocks[i] for i in range(self.num_blocks)])
     
     def get_n_bits(self):
         return self.diag_blocks.numel() * 16  # Assuming 16 bits per element for float16
