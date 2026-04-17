@@ -67,8 +67,13 @@ def _reduce(kl_sum, top1_agree, total_tokens, per_seq_kl):
 
 
 @torch.no_grad()
-def kl_eval_dual_gpu(base_model, quant_model, model_name, dataset_name, seqlen, log_wandb):
-    """KL(base || quant) with each model pinned to its own device."""
+def kl_eval_dual_gpu(base_model, quant_model, model_name, dataset_name, seqlen, log_wandb, chunk_size=512):
+    """KL(base || quant) with each model pinned to its own device.
+
+    Logits stay in fp16 until we pull them into a fp32 log-softmax chunk of
+    ``chunk_size`` tokens, so peak memory is ~2 * chunk_size * vocab * 4 bytes
+    per sequence rather than the full 2 * seqlen * vocab * 4.
+    """
     print(f"[dual_gpu] Evaluating KL on {dataset_name} ...")
     if seqlen == -1:
         seqlen = base_model.config.max_position_embeddings
@@ -83,17 +88,32 @@ def kl_eval_dual_gpu(base_model, quant_model, model_name, dataset_name, seqlen, 
     per_seq_kl = []
     for i in tqdm.tqdm(range(nsamples), desc=f"KL {dataset_name}"):
         batch = testenc[:, i * seqlen : (i + 1) * seqlen]
-        base_logits = base_model(batch.to(base_dev))["logits"].float()
-        quant_logits = quant_model(batch.to(quant_dev))["logits"].float().to(base_dev)
+        base_logits = base_model(batch.to(base_dev))["logits"]        # fp16, base_dev
+        quant_logits = quant_model(batch.to(quant_dev))["logits"]     # fp16, quant_dev
 
-        log_base = F.log_softmax(base_logits, dim=-1)
-        log_quant = F.log_softmax(quant_logits, dim=-1)
-        kl_tok = (log_base.exp() * (log_base - log_quant)).sum(dim=-1)
+        base_argmax = base_logits.argmax(-1)
+        quant_argmax = quant_logits.argmax(-1).to(base_dev)
+        top1_agree += (base_argmax == quant_argmax).sum().item()
 
-        kl_sum += kl_tok.sum().item()
-        top1_agree += (base_logits.argmax(-1) == quant_logits.argmax(-1)).sum().item()
-        total_tokens += kl_tok.numel()
-        per_seq_kl.append(kl_tok.mean().item())
+        T = base_logits.shape[1]
+        seq_kl_sum, seq_tokens = 0.0, 0
+        for s in range(0, T, chunk_size):
+            e = min(s + chunk_size, T)
+            bl = base_logits[:, s:e, :].float()
+            ql = quant_logits[:, s:e, :].to(base_dev).float()
+            lb = F.log_softmax(bl, dim=-1)
+            lq = F.log_softmax(ql, dim=-1)
+            kl_chunk = (lb.exp() * (lb - lq)).sum(dim=-1)
+            seq_kl_sum += kl_chunk.sum().item()
+            seq_tokens += kl_chunk.numel()
+            del bl, ql, lb, lq, kl_chunk
+
+        kl_sum += seq_kl_sum
+        total_tokens += seq_tokens
+        per_seq_kl.append(seq_kl_sum / seq_tokens)
+
+        del base_logits, quant_logits, base_argmax, quant_argmax
+        torch.cuda.empty_cache()
 
     out = _reduce(kl_sum, top1_agree, total_tokens, per_seq_kl)
     print(f"{dataset_name} KL: {out}")
@@ -208,6 +228,8 @@ def main():
     parser.add_argument("--quant_gpu", type=int, default=None, help="GPU index for quant model (dual_gpu mode)")
     parser.add_argument("--topk", type=int, default=128,
                         help="top-k retained in two_pass base cache (higher = closer to exact KL)")
+    parser.add_argument("--kl_chunk_size", type=int, default=512,
+                        help="Tokens per fp32 log-softmax chunk in dual_gpu mode (lower = less VRAM)")
     parser.add_argument("--cache_dir", type=str, default=None,
                         help="Where to write two_pass caches (default: system tempdir)")
     parser.add_argument("--log_wandb", action="store_true")
@@ -238,7 +260,8 @@ def main():
         quant_model = _load_quant(args.model_name, args.quant_model_path, args.load_custom_model, gpu=args.quant_gpu)
         base_model.eval(); quant_model.eval()
         for dataset in args.dataset_names:
-            out = kl_eval_dual_gpu(base_model, quant_model, args.model_name, dataset, args.seqlen, args.log_wandb)
+            out = kl_eval_dual_gpu(base_model, quant_model, args.model_name, dataset, args.seqlen,
+                                   args.log_wandb, chunk_size=args.kl_chunk_size)
             if args.save:
                 results_path = _save_result(args.results_path, args.quant_model_path, dataset, out,
                                             args.model_name, args.seqlen, mode, topk=None)
