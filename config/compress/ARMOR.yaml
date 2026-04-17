@@ -15,7 +15,7 @@ compression_config:
 
   optimizer_config:
     _target_: "torch.optim.Adam"
-    lr: 1e-3
+    lr: 1e-4
     # weight_decay: 0.001
 
   training_config:
@@ -26,7 +26,7 @@ compression_config:
     sparse_core_step_select: "gradient_all_random"
     loss_atol: 1e-8
     loss_rtol: 1e-6
-    overall_patience: 100
+    overall_patience: 2000
     log_freq: 100
     # logging_path: "/data/lliu/PermPrune/test/permute.txt"
     # plotting_path: "/data/lliu/PermPrune/test/permute.png"
