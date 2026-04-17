@@ -252,7 +252,7 @@ def sparse_core_step(trainable_sparse: BlockCompressLearnable,
     if selection_config.greedy:
         _, selected_idxs = torch.max(grad_norm, dim=-1)
     else:
-        selected_idxs = torch.multinomial(grad_norm, num_samples=1).squeeze(-1)
+        selected_idxs = torch.multinomial(grad_norm + 1e-12, num_samples=1).squeeze(-1)
 
     idx_0 = j * block_size_0 + selected_idxs // n_groups_per_block_row
     idx_1 = k * block_size_1 + (selected_idxs % n_groups_per_block_row) * group_size
