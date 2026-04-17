@@ -430,6 +430,13 @@ def get_divisors(x):
                 divisors.append(x // i)
     return sorted(divisors)
 
+@dataclass
+class QuantizedTrainingConfig(TrainingConfig):
+    # Defer patience check until i >= warmup_iters so the QAT spike doesn't trigger early-stop.
+    # Patience also counts against best-so-far (not prev iter) so noise in the flat tail doesn't keep resetting it.
+    warmup_iters: int = 1500
+
+
 class QuantizedARMOR_Linear(CompressedLinear):
     name = "QuantizedARMOR_Linear"
 
@@ -511,40 +518,44 @@ class QuantizedARMOR_Linear(CompressedLinear):
             _ = compiled_loss(trainable_sparse)
 
         remaining_patience = training_config.overall_patience
+        warmup_iters = getattr(training_config, "warmup_iters", 0)
+        best_loss = prev_iter_loss
         for i in tqdm.tqdm(range(training_config.n_iters), disable = not self.verbose):
-            
+
             #CONTINOUS STEP
             #reset the optimizers
-            optimizer.zero_grad()   
-            
-            recon_loss = compiled_loss(trainable_sparse) #trainable_sparse.recon_loss(reduction="mean") 
+            optimizer.zero_grad()
+
+            recon_loss = compiled_loss(trainable_sparse) #trainable_sparse.recon_loss(reduction="mean")
             loss = recon_loss
-            
+
             loss.backward()
             #step the optimizers
             optimizer.step()
-                    
+
             #SPARSE CORE STEP
             with torch.no_grad():
                 sparse_core_step(
                     trainable_sparse,
                     select=training_config.sparse_core_step_select,
                 )
-                    
+
              #loss stuff
             with torch.no_grad():
                 current_loss = compiled_loss(trainable_sparse).item() #trainable_sparse.recon_loss(reduction="mean").item()
-                if current_loss > (1 - training_config.loss_rtol) * prev_iter_loss or current_loss > prev_iter_loss - training_config.loss_atol:
+                if i < warmup_iters:
+                    # During warmup (covers the QAT spike) track best but never decrement patience.
+                    best_loss = min(best_loss, current_loss)
+                elif current_loss > (1 - training_config.loss_rtol) * best_loss or current_loss > best_loss - training_config.loss_atol:
                     remaining_patience -= 1
 
                     if remaining_patience == 0:
                         if self.verbose:
-                            print("Loss converged, stopping early")
+                            print(f"Loss converged, stopping early at iter {i}")
                         break
                 else:
+                    best_loss = current_loss
                     remaining_patience = training_config.overall_patience
-                    # best_state_dict = copy.deepcopy(trainable_sparse.state_dict())
-                prev_iter_loss = current_loss
             # )
                 
             if i%training_config.log_freq == training_config.log_freq-1 or i==0:
