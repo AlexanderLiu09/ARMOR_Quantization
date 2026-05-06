@@ -1,0 +1,17 @@
+defaults:
+  - ARMOR
+  - override ./@compression_config.naive_compression_config: prune_quantize
+  - _self_
+
+init_config:
+  _target_: "src.ARMOR_Quantize.QuantizedARMOR_Linear"
+  verbose: True
+compression_config:
+  block_diagonal_config:
+      block_size: 16
+  training_config:
+    _target_: "src.ARMOR_Quantize.QuantizedTrainingConfig"
+    warmup_iters: 1500
+    log_freq: 50
+    # n_sparse_core_updates_per_iter: 1
+    sparse_core_step_select: "gradient_all_Linf_random"

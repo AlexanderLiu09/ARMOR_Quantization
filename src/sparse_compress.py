@@ -54,7 +54,7 @@ class SparseLinear(compression_parent.CompressedLinear):
     @torch.no_grad()
     def sparsify(
         self,
-        frac_nonzero: float = 0.1,
+        frac_nonzero: float = 0.5,
         pattern: Optional[Tuple[int, int]] = None,
         sparse_group: Optional[Union[int, Literal["d_in"]]] = None,
         normalizer_kwargs: Optional[dict] = None,
@@ -165,20 +165,11 @@ class SparseLinear(compression_parent.CompressedLinear):
                     self.bias,
                 )
         else:
-            assert (
-                self.denormalization_method == "otf"
-            ), "on the fly denormalization is only supported for on the fly sparsity"
-            x = self.normalizer.denormalize_otf_in(x)
-            y = torch.zeros(list(x.shape[:-1]) + [self.out_features], device=x.device)
-            for sparse_module in self.sparse_modules:
-                if sparse_module is not None:
-                    y = y + sparse_module(x)
-            y = self.normalizer.denormalize_otf_out(y) + (
-                self.bias if self.bias is not None else 0
-            )
+            raise DeprecationWarning(f"forward method {self.forward_method} not implemented")
         return y
 
     def get_n_bits(self):
+        raise DeprecationWarning("get_n_bits is not no longer supported for SparseLinear, since it is not quantized. Use get_n_nonzero instead.")
         n_bits = 0
         if self.compressed:
             for sparse_module in self.sparse_modules:

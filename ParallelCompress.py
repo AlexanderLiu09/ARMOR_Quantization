@@ -149,10 +149,11 @@ def compression_worker(
             # compress the layer
             if cfg.resume_layerwise and os.path.exists(os.path.join(cfg.temp_path, layer_name + ".pt")):
                 compression_module.blank_recreate(**cfg.compress.compression_config)
-                compression_module.load_state_dict(torch.load(
+                state_dict = torch.load(
                     os.path.join(cfg.temp_path, layer_name + ".pt"),
                     map_location=device
-                ))
+                )
+                compression_module.load_state_dict(state_dict, strict=False)
                 compression_module.to(original_dtype)
             else:
                 if cfg.iter_sweep:
@@ -291,6 +292,9 @@ def main(cfg: DictConfig):
         # raise ValueError("This script is not ready to run yet, please use the new compress.py script instead")
         # create our list of tasks
         weight_paths = glob.glob(os.path.join(cfg.weight_path, "*/*.pt"))
+        if cfg.layer_filter is not None:
+            filters = [f.strip() for f in cfg.layer_filter.split(",")]
+            weight_paths = [p for p in weight_paths if any(f in p for f in filters)]
         print("n weights found", len(weight_paths))
         
         #parse the datasets
@@ -492,7 +496,7 @@ def main(cfg: DictConfig):
             orig_device = next(layer.parameters()).device
             # load the state dict
             state_dict = torch.load(save_path, map_location=orig_device)
-            layer.load_state_dict(state_dict)
+            layer.load_state_dict(state_dict, strict=False)
             layer.to(orig_dtype)
             # delete the state dict to save memory
             del state_dict

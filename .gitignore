@@ -52,3 +52,7 @@ tmp/*
 .claude/*
 box_token*
 ssh_key_b64.txt
+
+# Ignore local copy of the ARMOR paper
+armor_paper.pdf
+armor_paper.txt

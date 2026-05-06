@@ -107,7 +107,7 @@ class CompressedLinear(nn.Module):
         if normalizer is not None:
             self.normalizer = normalizer
             normalized_weight = self.normalizer.normalize(self.original_weight)
-        else:
+        elif normalizer_kwargs is not None:
             # print("normalizer_kwargs", normalizer_kwargs)
             if normalizer_kwargs is None:
                 print("Warning: normalizer_kwargs is None, using default")
@@ -115,6 +115,9 @@ class CompressedLinear(nn.Module):
             self.normalizer, normalized_weight = Normalizer.normalize_init(
                 self.original_weight, **normalizer_kwargs
             )
+        else:
+            #pass straight through
+            normalized_weight = self.original_weight
 
         return normalized_weight
 

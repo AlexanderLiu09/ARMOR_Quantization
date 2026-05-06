@@ -94,6 +94,7 @@ def main():
     parser.add_argument("--log_wandb", action='store_true', help="Log results to Weights & Biases")
     parser.add_argument("--save", action='store_true', help="Save results to a file")
     parser.add_argument("--results_path", type=str, default="None", help="Path to save results (if --save is True)")
+    parser.add_argument("--verify_quant", action='store_true', help="Print dtype of sparse core weight matrices to verify quantization")
     args = parser.parse_args()
     
     print("Arguments:", args)
@@ -125,7 +126,7 @@ def main():
         model = get_compressed_model_class(args.model_name).from_pretrained(args.model_path,
                                                         torch_dtype=torch.float16,
                                                         device_map="auto")
-        
+        # raise ValueError("stop")
     else:
         if args.model_path is not None:
             model = AutoModelForCausalLM.from_pretrained(
@@ -141,6 +142,15 @@ def main():
             )
             
     print(f"Model loaded: {args.model_name} from {args.model_path if args.load_custom_model else 'default path'}")
+
+    if args.verify_quant:
+        for name, module in model.named_modules():
+            if hasattr(module, 'naive_compression_module'):
+                ncm = module.naive_compression_module
+                if hasattr(ncm, 'X_int'):
+                    print(f"  {name}: X_int.dtype={ncm.X_int.dtype}, quantized={ncm.quantized}")
+                elif hasattr(ncm, 'X'):
+                    print(f"  {name}: X.dtype={ncm.X.dtype}, quantized={ncm.quantized} (NOT quantized)")
             
     for dataset in args.dataset_names:
         print(f"Evaluating dataset: {dataset}")

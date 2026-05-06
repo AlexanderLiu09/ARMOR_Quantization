@@ -1,0 +1,9 @@
+init_config:
+  _target_: "src.quantize_sparse.QuantizedSparseLinear"
+
+compression_config:
+  pattern: 
+    - 2
+    - 4
+  quant_precision: 4
+  groupsize: 128

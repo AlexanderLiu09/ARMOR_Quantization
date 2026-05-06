@@ -25,6 +25,7 @@ calibration_data_path: ${data_dir}/${base_model}/${calibration_data_type}
 save_path: ./models/${base_model}/compressed/${run_name}
 temp_path: ./models/${base_model}/temp/${run_name}
 
+layer_filter: null #set to a substring to only compress matching layers (e.g. "layer_1/self_attn.v_proj")
 seed: 0
 add_bias: False
 resume_layerwise: True
